@@ -593,6 +593,103 @@ fn render_ward_proposal(proposal: &Value) -> String {
     out
 }
 
+// ── coven ward audit ─────────────────────────────────────────────────────────
+
+pub(crate) fn run_ward_audit(
+    familiar_id: &str,
+    limit: Option<u32>,
+    event: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let coven_home = coven_home_dir()?;
+    let path = ward_audit_path(familiar_id, limit, event)?;
+    let body = api_get(&coven_home, &path)?;
+    if json {
+        return print_json(&body);
+    }
+    print!("{}", render_ward_audit(&body));
+    Ok(())
+}
+
+fn ward_audit_path(familiar_id: &str, limit: Option<u32>, event: Option<&str>) -> Result<String> {
+    if familiar_id.is_empty()
+        || familiar_id.bytes().any(|byte| {
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(byte, b'/' | b'\\' | b'?' | b'#' | b'%')
+        })
+    {
+        bail!(
+            "familiar id must be a non-empty URL path segment without delimiters, whitespace, or control characters"
+        );
+    }
+    let mut path = format!("/api/v1/familiars/{familiar_id}/audit");
+    let mut params = Vec::new();
+    if let Some(limit) = limit {
+        params.push(format!("limit={limit}"));
+    }
+    if let Some(event) = event {
+        crate::api::validate_ward_audit_event_tag(event)
+            .with_context(|| "--event must be a known lowercase ASCII ward_audit event tag")?;
+        params.push(format!("event={event}"));
+    }
+    if !params.is_empty() {
+        path.push('?');
+        path.push_str(&params.join("&"));
+    }
+    Ok(path)
+}
+
+fn render_ward_audit(body: &Value) -> String {
+    let records = body
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if records.is_empty() {
+        return concat!(
+            "No matching ward_audit rows.\n",
+            "Applied Tier-2 writes, gate verdicts, and proposal events land here\n",
+            "(append-only, RFC-0001 §5.6).\n"
+        )
+        .to_string();
+    }
+    let rows: Vec<Vec<String>> = records
+        .iter()
+        .map(|record| {
+            let surfaces = record
+                .get("filesTouched")
+                .and_then(Value::as_array)
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            vec![
+                record
+                    .get("id")
+                    .and_then(Value::as_i64)
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                str_cell(record, "eventType"),
+                str_cell(record, "tier"),
+                str_cell(record, "decision"),
+                theme::fit_chars(&surfaces, TEXT_CELL_LIMIT),
+                str_cell(record, "decidedAt"),
+            ]
+        })
+        .collect();
+    let mut out = render_table(
+        &["ID", "EVENT", "TIER", "DECISION", "SURFACES", "DECIDED"],
+        &rows,
+    );
+    out.push_str(&format!("\n{} audit row(s), newest first\n", records.len()));
+    out
+}
+
 // ── coven calls ──────────────────────────────────────────────────────────────
 
 pub(crate) fn run_calls(id: Option<&str>, json: bool) -> Result<()> {
@@ -1375,6 +1472,47 @@ fn resolve_full_session_id(reference: &str) -> Result<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ward_audit_path_rejects_ambiguous_event_query_values() {
+        for event in [
+            "apply_audit&limit=1",
+            "apply_audit=1",
+            "apply audit",
+            "äpply",
+            "unknown_tag",
+        ] {
+            let error = ward_audit_path("sage", Some(10), Some(event))
+                .expect_err("unsafe event query value must be rejected");
+            assert!(error.to_string().contains("--event"), "{event}: {error:#}");
+        }
+    }
+
+    #[test]
+    fn ward_audit_path_rejects_ambiguous_familiar_path_segments() {
+        for familiar_id in [
+            "",
+            "sa/ge",
+            "sage?limit=1",
+            "sage#fragment",
+            "sage%2Faudit",
+            "sage name",
+        ] {
+            let error = ward_audit_path(familiar_id, None, None)
+                .expect_err("unsafe familiar path segment must be rejected");
+            assert!(
+                error.to_string().contains("familiar id"),
+                "{familiar_id}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_ward_audit_empty_output_is_filter_safe() {
+        let output = render_ward_audit(&json!({ "records": [] }));
+
+        assert!(output.starts_with("No matching ward_audit rows.\n"));
+    }
 
     #[test]
     fn render_table_pads_columns_and_trims_trailing_space() {

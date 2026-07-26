@@ -697,6 +697,25 @@ enum WardCommand {
         #[arg(long, help = "Print proposals as JSON (machine-readable)")]
         json: bool,
     },
+    #[command(about = "Show the append-only ward_audit ledger for one familiar")]
+    Audit {
+        #[arg(help = "Familiar id (familiars.toml key)")]
+        familiar: String,
+        #[arg(
+            long,
+            value_name = "N",
+            help = "Maximum rows to show, newest first (default 100, max 1000)"
+        )]
+        limit: Option<u32>,
+        #[arg(
+            long,
+            value_name = "TYPE",
+            help = "Only rows with this event type (proposal_submitted, proposal_window_opened, proposal_approved, proposal_rejected, proposal_vetoed, ward_updated, memory_entry_admitted, principal_authorized_write, validation_verdict, compaction_ledger, apply_audit)"
+        )]
+        event: Option<String>,
+        #[arg(long, help = "Print the ledger as JSON (machine-readable)")]
+        json: bool,
+    },
     #[command(about = "Migrate Ward v0.1 ward.toml files to Phase-2 WardConfig")]
     Migrate {
         #[arg(long, value_name = "ID", help = "Only migrate the named familiar")]
@@ -2853,6 +2872,14 @@ fn run_ward_command(command: WardCommand) -> Result<()> {
     match command {
         WardCommand::Pending { id, json } => {
             return observe::run_ward_pending(id.as_deref(), json);
+        }
+        WardCommand::Audit {
+            familiar,
+            limit,
+            event,
+            json,
+        } => {
+            return observe::run_ward_audit(&familiar, limit, event.as_deref(), json);
         }
         WardCommand::Migrate {
             familiar,

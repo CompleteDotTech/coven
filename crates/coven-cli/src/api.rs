@@ -352,6 +352,14 @@ pub fn handle_request_with_runtime(
                 .trim_end_matches("/edits");
             apply_familiar_edits(coven_home, id, body)
         }
+        // The append-only ward_audit ledger for one familiar — where the
+        // /edits write path persists its Gate 4 apply records (#414).
+        ("GET", path) if path.starts_with("/familiars/") && path.ends_with("/audit") => {
+            let id = path
+                .trim_start_matches("/familiars/")
+                .trim_end_matches("/audit");
+            familiar_audit_response(coven_home, id, query)
+        }
         ("GET", "/threads/weaves") => threads_weaves_response(coven_home),
         ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None),
         ("GET", path) if path.starts_with("/threads/proposals/") => {
@@ -2797,6 +2805,38 @@ fn apply_familiar_edits(
             }),
         );
     }
+    // Gate 4 persistence (#414): the audit records returned to the client
+    // also land in the append-only ward_audit ledger, so applied writes stay
+    // observable across daemon restarts. Persist before advancing protected
+    // baselines so a post-write failure is less likely to leave an audit gap.
+    // On persistence failure, return a structured 500 that includes the applied
+    // changes so clients can distinguish "write applied, audit failed" from a
+    // full failure and avoid blind retries that would produce duplicate writes.
+    {
+        let mut conn = store::open_store(&store_path(coven_home))?;
+        if let Err(err) = crate::threads_gate::persist_apply_audit_records(
+            &mut conn,
+            familiar_id,
+            &workspace,
+            &config,
+            &report,
+        ) {
+            return json_response(
+                500,
+                &json!({
+                    "error": {
+                        "code": "audit_persist_failed",
+                        "message": format!(
+                            "The file write was applied but the audit ledger \
+                             could not be updated: {err:#}"
+                        ),
+                        "details": { "writeApplied": true },
+                    },
+                    "changes": changes,
+                }),
+            );
+        }
+    }
     advance_applied_protected_baselines(coven_home, familiar_id, &workspace, &report.changes)?;
     json_response(
         200,
@@ -2895,6 +2935,200 @@ fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiRes
 }
 
 const DEGRADED_WARD_CONFIG_UNPARSEABLE: &str = "ward-config-unparseable";
+
+fn normalize_ward_audit_tier(tier: Option<String>) -> Option<String> {
+    tier.map(|value| {
+        value
+            .parse::<u8>()
+            .map(|number| format!("tier_{number}"))
+            .unwrap_or(value)
+    })
+}
+
+/// `GET /familiars/{id}/audit` — the append-only `ward_audit` ledger for one
+/// familiar, newest first (#414; RFC-0001 §5.6).
+///
+/// Read-side twin of the `/edits` write path's Gate 4 persistence: rows come
+/// straight from the store the write path appends to — no separate source of
+/// truth. Unlike `/ward` this endpoint does not require a live `ward.toml`:
+/// the ledger is append-only history and stays observable even after a
+/// familiar's Ward config is removed. Unknown familiars are structured 404s.
+///
+/// Query parameters: `limit` (rows, default 100, max 1000) and `event`
+/// (exact `event_type` filter, e.g. `apply_audit`).
+fn familiar_audit_response(
+    coven_home: &Path,
+    familiar_id: &str,
+    query: Option<&str>,
+) -> Result<ApiResponse> {
+    if familiar_id.is_empty() || familiar_id.contains('/') {
+        return api_error(
+            400,
+            "invalid_request",
+            "Familiar id is required and must not contain '/'.",
+            None,
+        );
+    }
+    if crate::familiar_identity::resolve(coven_home, familiar_id)?.is_none() {
+        return api_error(
+            404,
+            "familiar_not_found",
+            "No familiar with that id is declared in familiars.toml.",
+            Some(json!({ "id": familiar_id })),
+        );
+    }
+    let limit = match query.and_then(|q| query_param(q, "limit")) {
+        None => 100_i64,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if (1..=1000).contains(&n) => n,
+            _ => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    "Query parameter `limit` must be an integer between 1 and 1000.",
+                    Some(json!({ "limit": raw })),
+                );
+            }
+        },
+    };
+    let event = match query.and_then(|q| query_param(q, "event")) {
+        Some(event) => {
+            if let Err(message) = validate_ward_audit_event_tag(event) {
+                let message = message.to_string();
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &message,
+                    Some(json!({ "event": event })),
+                );
+            }
+            Some(event)
+        }
+        None => None,
+    };
+
+    let conn = store::open_store(&store_path(coven_home))?;
+    let mut sql = String::from(
+        "SELECT id, event_type, proposal_id, ward_version, ward_hash,
+                CAST(tier AS TEXT),
+                decision, approver, diff_hash, detail, files_touched, channel,
+                thread_id, submitted_at, decided_at, recorded_at
+         FROM ward_audit WHERE familiar_id = ?1",
+    );
+    if event.is_some() {
+        sql.push_str(" AND event_type = ?3");
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT ?2");
+    let mut statement = conn.prepare(&sql)?;
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Value> {
+        let ward_hash: Vec<u8> = row.get(4)?;
+        let tier = normalize_ward_audit_tier(row.get(5)?);
+        let diff_hash: Option<Vec<u8>> = row.get(8)?;
+        let detail: Option<String> = row.get(9)?;
+        let files_touched: String = row.get(10)?;
+        let files_touched = serde_json::from_str::<Value>(&files_touched)
+            .ok()
+            .filter(Value::is_array)
+            .unwrap_or_else(|| json!([]));
+        let (detail, detail_raw) = match detail {
+            Some(raw) => match serde_json::from_str::<Value>(&raw) {
+                Ok(parsed) => (parsed, None),
+                Err(_) => (Value::Null, Some(raw)),
+            },
+            None => (Value::Null, None),
+        };
+        let mut record = serde_json::Map::from_iter([
+            ("id".to_string(), json!(row.get::<_, i64>(0)?)),
+            ("eventType".to_string(), json!(row.get::<_, String>(1)?)),
+            (
+                "proposalId".to_string(),
+                json!(row.get::<_, Option<String>>(2)?),
+            ),
+            (
+                "wardVersion".to_string(),
+                json!(row.get::<_, Option<String>>(3)?),
+            ),
+            ("wardHash".to_string(), json!(hex_string(&ward_hash))),
+            ("tier".to_string(), json!(tier)),
+            ("decision".to_string(), json!(row.get::<_, String>(6)?)),
+            (
+                "approver".to_string(),
+                json!(row.get::<_, Option<String>>(7)?),
+            ),
+            (
+                "diffSha256".to_string(),
+                json!(diff_hash.as_deref().map(hex_string)),
+            ),
+            ("detail".to_string(), detail),
+            ("filesTouched".to_string(), files_touched),
+            (
+                "channel".to_string(),
+                json!(row.get::<_, Option<String>>(11)?),
+            ),
+            (
+                "threadId".to_string(),
+                json!(row.get::<_, Option<String>>(12)?),
+            ),
+            ("submittedAt".to_string(), json!(row.get::<_, String>(13)?)),
+            ("decidedAt".to_string(), json!(row.get::<_, String>(14)?)),
+            ("recordedAt".to_string(), json!(row.get::<_, String>(15)?)),
+        ]);
+        if let Some(raw) = detail_raw {
+            record.insert("detailRaw".to_string(), Value::String(raw));
+        }
+        Ok(Value::Object(record))
+    };
+    let records: Vec<Value> = match event {
+        Some(event) => statement
+            .query_map(rusqlite::params![familiar_id, limit, event], map_row)?
+            .collect::<rusqlite::Result<_>>()?,
+        None => statement
+            .query_map(rusqlite::params![familiar_id, limit], map_row)?
+            .collect::<rusqlite::Result<_>>()?,
+    };
+    json_response(
+        200,
+        &json!({
+            "ok": true,
+            "familiarId": familiar_id,
+            "records": records,
+        }),
+    )
+}
+
+pub(crate) const WARD_AUDIT_EVENT_TAGS: &[&str] = &[
+    "proposal_submitted",
+    "proposal_window_opened",
+    "proposal_approved",
+    "proposal_rejected",
+    "proposal_vetoed",
+    "ward_updated",
+    "memory_entry_admitted",
+    "principal_authorized_write",
+    "validation_verdict",
+    "compaction_ledger",
+    "apply_audit",
+];
+
+pub(crate) fn validate_ward_audit_event_tag(event: &str) -> Result<()> {
+    anyhow::ensure!(
+        !event.is_empty()
+            && event
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'),
+        "Query parameter `event` must be a lowercase ASCII event tag containing only lowercase letters, digits, and `_`."
+    );
+    anyhow::ensure!(
+        WARD_AUDIT_EVENT_TAGS.contains(&event),
+        "Query parameter `event` must be a known ward_audit event tag."
+    );
+    Ok(())
+}
+
+/// Lowercase hex of raw hash bytes for API payloads.
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// `GET /api/v1/threads/proposals[/:id]` — the pending-proposal read surface
 /// (Gate 3 PR 3, `docs/design/ward-gate3-coherence.md` G3.3).
@@ -8668,6 +8902,267 @@ tier = 1
     }
 
     #[test]
+    fn post_familiar_edits_persists_apply_audit_rows_across_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let first = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello ward"}]}"#,
+        )?;
+        assert_eq!(first.status, 200, "got {}", first.body);
+        let first_body: Value = serde_json::from_str(&first.body)?;
+        let first_next = first_body["changes"][0]["audit"]["nextSha256"]
+            .as_str()
+            .expect("apply response carries nextSha256")
+            .to_string();
+
+        // A fresh store connection stands in for a daemon restart: the rows
+        // must come from disk, not the in-memory ApplyReport.
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let (tier, decision, diff_hash, detail, files_touched): (
+            String,
+            String,
+            Vec<u8>,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT tier, decision, diff_hash, detail, files_touched
+             FROM ward_audit WHERE event_type = 'apply_audit' AND familiar_id = 'sage'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(tier, "tier_2");
+        assert_eq!(decision, "applied");
+        assert_eq!(hex_string(&diff_hash), first_next);
+        let detail: Value = serde_json::from_str(&detail)?;
+        assert!(detail["prev_sha256"].is_null(), "created file has no prev");
+        assert_eq!(detail["bytes_written"], "hello ward".len() as u64);
+        assert_eq!(
+            serde_json::from_str::<Value>(&files_touched)?,
+            serde_json::json!(["notes/today.md"])
+        );
+
+        // Overwrite: the second row's prev must chain to the first's next.
+        let second = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"hello again"}]}"#,
+        )?;
+        assert_eq!(second.status, 200, "got {}", second.body);
+        let second_detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit
+             WHERE event_type = 'apply_audit' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let second_detail: Value = serde_json::from_str(&second_detail)?;
+        assert_eq!(second_detail["prev_sha256"], Value::String(first_next));
+
+        // The ledger stays append-only under the new event type.
+        let tampered = conn.execute(
+            "UPDATE ward_audit SET decision = 'forged' WHERE event_type = 'apply_audit'",
+            [],
+        );
+        assert!(
+            tampered.is_err(),
+            "append-only trigger must abort UPDATEs on apply_audit rows"
+        );
+        Ok(())
+    }
+
+    // ---- GET /api/v1/familiars/{id}/audit (ward_audit read surface) -------
+
+    #[test]
+    fn familiar_audit_route_serves_ledger_rows_newest_first() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["records"], serde_json::json!([]));
+
+        post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/a.md","contents":"one"}]}"#,
+        )?;
+        post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/b.md","contents":"two"}]}"#,
+        )?;
+
+        let response = handle_request(
+            "GET",
+            "/api/v1/familiars/sage/audit?event=apply_audit",
+            home,
+            None,
+        )?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let records = body["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 2);
+        // Newest first: the second write leads.
+        assert_eq!(
+            records[0]["filesTouched"],
+            serde_json::json!(["notes/b.md"])
+        );
+        assert_eq!(records[0]["eventType"], "apply_audit");
+        assert_eq!(records[0]["tier"], "tier_2");
+        assert_eq!(records[0]["decision"], "applied");
+        assert_eq!(records[0]["channel"], "mutation");
+        assert!(records[0]["diffSha256"].is_string());
+        assert_eq!(records[0]["detail"]["bytes_written"], 3);
+
+        let limited = handle_request(
+            "GET",
+            "/api/v1/familiars/sage/audit?event=apply_audit&limit=1",
+            home,
+            None,
+        )?;
+        let body: Value = serde_json::from_str(&limited.body)?;
+        assert_eq!(body["records"].as_array().map(Vec::len), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_keeps_files_touched_an_array_for_malformed_legacy_json() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, decision, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('apply_audit', 'sage', ?1, 'applied', ?2, ?3, ?3)",
+            rusqlite::params![
+                vec![0x11_u8; 32],
+                "{malformed legacy json",
+                "2026-07-26T00:00:00Z"
+            ],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["records"][0]["filesTouched"], serde_json::json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_preserves_malformed_detail_as_detail_raw() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, decision, detail, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('apply_audit', 'sage', ?1, 'applied', ?2, '[]', ?3, ?3)",
+            rusqlite::params![
+                vec![0x11_u8; 32],
+                "{malformed detail",
+                "2026-07-26T00:00:00Z"
+            ],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert!(body["records"][0]["detail"].is_null());
+        assert_eq!(body["records"][0]["detailRaw"], "{malformed detail");
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_normalizes_numeric_legacy_tier() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, tier, decision, files_touched,
+                submitted_at, decided_at
+             ) VALUES ('proposal_submitted', 'sage', ?1, ?2, 'staged:coherence',
+                       '[]', ?3, ?3)",
+            rusqlite::params![vec![0x11_u8; 32], 1_i64, "2026-07-26T00:00:00Z"],
+        )?;
+
+        let response = handle_request("GET", "/api/v1/familiars/sage/audit", home, None)?;
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["records"][0]["tier"], "tier_1");
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_route_fails_closed_on_unknown_and_bad_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        let response = handle_request("GET", "/api/v1/familiars/ghost/audit", home, None)?;
+        assert_eq!(response.status, 404, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "familiar_not_found");
+
+        for path in [
+            "/api/v1/familiars/sage/audit?limit=0",
+            "/api/v1/familiars/sage/audit?limit=1001",
+            "/api/v1/familiars/sage/audit?limit=abc",
+            "/api/v1/familiars/sage/audit?event=",
+            "/api/v1/familiars/sage/audit?event=ApplyAudit",
+            "/api/v1/familiars/sage/audit?event=apply%20audit",
+            "/api/v1/familiars/sage/audit?event=unknown_tag",
+        ] {
+            let response = handle_request("GET", path, home, None)?;
+            assert_eq!(response.status, 400, "path {path} got {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "invalid_request");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn familiar_audit_event_filter_accepts_every_ledger_event_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+
+        for event in [
+            "proposal_submitted",
+            "proposal_window_opened",
+            "proposal_approved",
+            "proposal_rejected",
+            "proposal_vetoed",
+            "ward_updated",
+            "memory_entry_admitted",
+            "principal_authorized_write",
+            "validation_verdict",
+            "compaction_ledger",
+            "apply_audit",
+        ] {
+            let path = format!("/api/v1/familiars/sage/audit?event={event}");
+            let response = handle_request("GET", &path, home, None)?;
+            assert_eq!(response.status, 200, "event {event} got {}", response.body);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn post_familiar_edits_refuses_traversal_and_writes_nothing() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -8856,7 +9351,8 @@ tier = 1
     #[test]
     fn post_familiar_edits_editable_tier_bypasses_the_weave() -> Result<()> {
         // Editable-tier writes are the Ward tiers' lane: the weave reports no
-        // verdicts and appends nothing to ward_audit.
+        // verdicts and appends no validation rows to ward_audit. Gate 4
+        // persistence (#414) still appends the applied write's audit record.
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         seed_warded_familiar(home)?;
@@ -8871,8 +9367,18 @@ tier = 1
             Some(0)
         );
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
-        assert_eq!(count, 0);
+        let verdict_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'validation_verdict'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(verdict_count, 0, "weave must not adjudicate editable tiers");
+        let apply_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_count, 1, "applied tier-2 write must persist Gate 4");
         Ok(())
     }
 
