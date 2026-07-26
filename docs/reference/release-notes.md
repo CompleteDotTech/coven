@@ -6,6 +6,18 @@ read_when:
 title: "Coven changelog and release notes"
 ---
 
+## Week of July 26, 2026
+
+### New features
+
+- **Safe memory reads for local dashboards.** `GET /api/v1/memory` now returns
+  stable opaque ids and machine-readable timestamps while preserving its
+  existing summary fields. `GET /api/v1/memory/overview` reports counts and
+  explicit capability state; `GET /api/v1/memory/:id` returns validated
+  markdown content without a filesystem path. Unsupported privacy,
+  verification, attestation, and supersession metadata stays explicitly
+  unavailable or unknown so clients can fail closed.
+
 ## Week of July 14, 2026
 
 ### New features

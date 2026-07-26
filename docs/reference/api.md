@@ -64,10 +64,19 @@ These power `coven status`, `coven familiars`, `coven skills`, `coven memory`, `
 | GET | `/api/v1/familiars/:id/ward` | One familiar's declared Ward surface (tiers, protected paths, principal binding) — the read twin of `/familiars/:id/edits`. | `{ ok, familiarId, workspace, ward }` · `400 invalid_request` / `404 familiar_not_found` / `404 ward_not_configured` / `500 ward_config_invalid` |
 | GET | `/api/v1/skills` | Installed skills from `~/.coven/skills/`. | `SkillDto[]` |
 | GET | `/api/v1/memory` | Familiar memory files from `~/.coven/memory/`. | memory list |
+| GET | `/api/v1/memory/overview` | Memory counts plus explicit detail, verification, attestation, supersession, and mutation capability state. | overview object |
+| GET | `/api/v1/memory/:id` | Validated markdown content for an opaque id returned by the memory list. | memory detail · `400 invalid_request` / `404 memory_not_found` |
 | GET | `/api/v1/research` | Research loop log rows. | research list |
 | GET | `/api/v1/coven-calls` | Coven Calls delegation ledger. | `{ ok, calls }` |
 | GET | `/api/v1/coven-calls/:id` | One delegation call. | `{ ok, call }` · `404 call_not_found` |
 | GET | `/api/v1/cast-codes` | Cast code catalog (`~?`, `~>` …). | code list |
+
+Memory list `path` values are relative compatibility fields, never absolute
+filesystem paths. Browser-facing clients should remove them from their own
+DTOs. Detail responses contain no path field. Until the promotion privacy and
+verification contracts land, the API reports those capabilities as unavailable
+and returns unknown/null metadata rather than inferring a healthy or public
+state.
 
 ## Cast and familiar writes
 

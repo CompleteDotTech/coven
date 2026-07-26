@@ -51,6 +51,9 @@ Negotiate against `apiVersion` and `capabilities` before depending on session or
 | `POST /api/v1/sessions` | Launch a session. |
 | `GET /api/v1/sessions/:id` | Fetch one session. |
 | `GET /api/v1/events?sessionId=...` | Read session events. |
+| `GET /api/v1/memory` | List familiar memory summaries with opaque ids. |
+| `GET /api/v1/memory/overview` | Read memory totals and capability state. |
+| `GET /api/v1/memory/:id` | Read validated markdown content for a list id. |
 | `POST /api/v1/sessions/:id/input` | Forward input to a live session. |
 | `POST /api/v1/sessions/:id/kill` | Kill a live session. |
 | `POST /api/v1/store/vacuum` | Rebuild the event FTS index and compact the SQLite store. |

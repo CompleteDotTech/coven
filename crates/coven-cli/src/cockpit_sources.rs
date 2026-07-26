@@ -322,18 +322,133 @@ pub struct MemoryFileDto {
     pub title: String,
     pub path: String,
     pub updated_at: String,
+    pub updated_at_iso: String,
     pub excerpt: String,
+    pub privacy_classification: Option<String>,
+    pub reveal_required: Option<bool>,
+    pub verification_state: String,
 }
 
-pub fn scan_memory(coven_home: &Path) -> Result<Vec<MemoryFileDto>> {
+#[derive(Debug, Clone)]
+struct MemoryRecord {
+    id: String,
+    familiar_id: String,
+    title: String,
+    relative_path: String,
+    updated_at: String,
+    updated_at_iso: String,
+    body: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySourceDto {
+    pub kind: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryPrivacyDto {
+    pub classification: Option<String>,
+    pub reveal_required: Option<bool>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryVerificationDto {
+    pub state: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemorySupersessionDto {
+    pub supersedes: Option<String>,
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryDetailDto {
+    pub id: String,
+    pub familiar_id: String,
+    pub title: String,
+    pub updated_at: String,
+    pub source: MemorySourceDto,
+    pub content: String,
+    pub content_format: String,
+    pub privacy: MemoryPrivacyDto,
+    pub verification: MemoryVerificationDto,
+    pub attestation: Option<serde_json::Value>,
+    pub supersession: MemorySupersessionDto,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryOverviewTotalsDto {
+    pub entries: usize,
+    pub familiars: usize,
+    pub verified: usize,
+    pub needs_review: usize,
+    pub unknown: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryCapabilitiesDto {
+    pub detail: bool,
+    pub verification: bool,
+    pub attestation_metadata: bool,
+    pub supersession_history: bool,
+    pub mutations: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryOverviewVerificationDto {
+    pub state: String,
+    pub checked_at: String,
+    pub manifest: Option<String>,
+    pub index: Option<String>,
+    pub issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemoryOverviewDto {
+    pub generated_at: String,
+    pub totals: MemoryOverviewTotalsDto,
+    pub last_updated_at: Option<String>,
+    pub capabilities: MemoryCapabilitiesDto,
+    pub verification: MemoryOverviewVerificationDto,
+}
+
+const MEMORY_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x88f4_153f_221e_4f51_9346_7f59_d9b2_8d57);
+
+fn memory_id(relative_path: &str) -> String {
+    uuid::Uuid::new_v5(&MEMORY_ID_NAMESPACE, relative_path.as_bytes()).to_string()
+}
+
+fn scan_memory_records(coven_home: &Path) -> Result<Vec<MemoryRecord>> {
     let root = coven_home.join(MEMORY_DIR);
+    let root_metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).context("failed to inspect memory root"),
+    };
+    if root_metadata.file_type().is_symlink() {
+        anyhow::bail!("refusing to read a symlinked memory root");
+    }
+    if !root_metadata.is_dir() {
+        anyhow::bail!("memory root is not a directory");
+    }
     let familiar_dirs = match fs::read_dir(&root) {
         Ok(it) => it,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to read {}", root.display()));
-        }
+        Err(err) => return Err(err).context("failed to read memory root"),
     };
+    let canonical_home = coven_home
+        .canonicalize()
+        .context("failed to resolve Coven home")?;
+    let canonical_root = root
+        .canonicalize()
+        .context("failed to resolve memory root")?;
+    if !canonical_root.starts_with(&canonical_home) {
+        anyhow::bail!("refusing to read a memory root outside Coven home");
+    }
     let mut out = Vec::new();
     for familiar_entry in familiar_dirs {
         let familiar_entry = familiar_entry?;
@@ -343,7 +458,7 @@ pub fn scan_memory(coven_home: &Path) -> Result<Vec<MemoryFileDto>> {
         let familiar_id = familiar_entry.file_name().to_string_lossy().into_owned();
         let familiar_dir = familiar_entry.path();
         let file_iter = fs::read_dir(&familiar_dir)
-            .with_context(|| format!("failed to read {}", familiar_dir.display()))?;
+            .with_context(|| format!("failed to read familiar memory directory {familiar_id}"))?;
         for file_entry in file_iter {
             let file_entry = file_entry?;
             if !file_entry.file_type()?.is_file() {
@@ -363,27 +478,132 @@ pub fn scan_memory(coven_home: &Path) -> Result<Vec<MemoryFileDto>> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("untitled.md")
                 .to_string();
+            let relative_path = format!("{familiar_id}/{file_name}");
+            let canonical_file = file_path
+                .canonicalize()
+                .with_context(|| format!("failed to resolve memory entry {relative_path}"))?;
+            if !canonical_file.starts_with(&canonical_root) {
+                continue;
+            }
             let metadata = file_entry.metadata()?;
-            let updated_at = metadata
-                .modified()
-                .ok()
+            let modified = metadata.modified().ok();
+            let updated_at = modified
                 .map(relative_time)
                 .unwrap_or_else(|| "—".to_string());
-            let body = fs::read_to_string(&file_path)
-                .with_context(|| format!("failed to read {}", file_path.display()))?;
-            let excerpt = first_paragraph(&body, 200);
-            out.push(MemoryFileDto {
-                id: format!("{familiar_id}-{stem}"),
+            let modified_utc: chrono::DateTime<chrono::Utc> =
+                modified.unwrap_or(SystemTime::UNIX_EPOCH).into();
+            let updated_at_iso = modified_utc.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let body = fs::read_to_string(&canonical_file)
+                .with_context(|| format!("failed to read memory entry {relative_path}"))?;
+            out.push(MemoryRecord {
+                id: memory_id(&relative_path),
                 familiar_id: familiar_id.clone(),
                 title: stem,
-                path: format!("{familiar_id}/{file_name}"),
+                relative_path,
                 updated_at,
-                excerpt,
+                updated_at_iso,
+                body,
             });
         }
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Ok(out)
+}
+
+pub fn scan_memory(coven_home: &Path) -> Result<Vec<MemoryFileDto>> {
+    Ok(scan_memory_records(coven_home)?
+        .into_iter()
+        .map(|record| MemoryFileDto {
+            id: record.id,
+            familiar_id: record.familiar_id,
+            title: record.title,
+            path: record.relative_path,
+            updated_at: record.updated_at,
+            updated_at_iso: record.updated_at_iso,
+            excerpt: first_paragraph(&record.body, 200),
+            privacy_classification: None,
+            reveal_required: None,
+            verification_state: "unknown".to_string(),
+        })
+        .collect())
+}
+
+pub fn read_memory_detail(coven_home: &Path, id: &str) -> Result<Option<MemoryDetailDto>> {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Ok(None);
+    }
+    let record = scan_memory_records(coven_home)?
+        .into_iter()
+        .find(|record| record.id == id);
+    Ok(record.map(|record| MemoryDetailDto {
+        id: record.id,
+        familiar_id: record.familiar_id,
+        title: record.title,
+        updated_at: record.updated_at_iso,
+        source: MemorySourceDto {
+            kind: "coven-origin".to_string(),
+            label: "Coven origin".to_string(),
+        },
+        content: record.body,
+        content_format: "markdown".to_string(),
+        privacy: MemoryPrivacyDto {
+            classification: None,
+            reveal_required: None,
+            reason: "privacy taxonomy unavailable".to_string(),
+        },
+        verification: MemoryVerificationDto {
+            state: "unknown".to_string(),
+            reason: "verification metadata unavailable".to_string(),
+        },
+        attestation: None,
+        supersession: MemorySupersessionDto {
+            supersedes: None,
+            superseded_by: None,
+        },
+    }))
+}
+
+pub fn memory_overview(coven_home: &Path) -> Result<MemoryOverviewDto> {
+    use std::collections::HashSet;
+
+    let records = scan_memory_records(coven_home)?;
+    let familiars = records
+        .iter()
+        .map(|record| record.familiar_id.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    let last_updated_at = records
+        .iter()
+        .map(|record| record.updated_at_iso.as_str())
+        .max()
+        .map(str::to_string);
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    Ok(MemoryOverviewDto {
+        generated_at: generated_at.clone(),
+        totals: MemoryOverviewTotalsDto {
+            entries: records.len(),
+            familiars,
+            verified: 0,
+            needs_review: 0,
+            unknown: records.len(),
+        },
+        last_updated_at,
+        capabilities: MemoryCapabilitiesDto {
+            detail: true,
+            verification: false,
+            attestation_metadata: false,
+            supersession_history: false,
+            mutations: false,
+        },
+        verification: MemoryOverviewVerificationDto {
+            state: "unavailable".to_string(),
+            checked_at: generated_at,
+            manifest: None,
+            index: None,
+            issues: Vec::new(),
+        },
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -909,6 +1129,124 @@ description = "..."
         assert_eq!(out[1].familiar_id, "sage");
         assert_eq!(out[1].path, "sage/notes.md");
         assert!(out[1].excerpt.starts_with("First paragraph"));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_memory_returns_stable_opaque_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let first = scan_memory(temp.path())?;
+        let second = scan_memory(temp.path())?;
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, second[0].id);
+        assert!(uuid::Uuid::parse_str(&first[0].id).is_ok());
+        assert!(!first[0].id.contains("sage"));
+        assert!(!first[0].id.contains("notes"));
+        Ok(())
+    }
+
+    #[test]
+    fn scan_memory_exposes_machine_readable_unknown_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let entry = scan_memory(temp.path())?.remove(0);
+
+        assert!(entry.updated_at_iso.ends_with('Z'));
+        assert!(chrono::DateTime::parse_from_rfc3339(&entry.updated_at_iso).is_ok());
+        assert_eq!(entry.privacy_classification, None);
+        assert_eq!(entry.reveal_required, None);
+        assert_eq!(entry.verification_state, "unknown");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_memory_skips_symlinked_markdown_files() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        let outside = temp.path().join("outside.md");
+        fs::write(&outside, "private outside content")?;
+        symlink(&outside, sage.join("leak.md"))?;
+
+        assert!(scan_memory(temp.path())?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_memory_rejects_a_symlinked_memory_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let sage = outside.path().join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("leak.md"), "private outside content")?;
+        symlink(outside.path(), temp.path().join(MEMORY_DIR))?;
+
+        let error = scan_memory(temp.path()).expect_err("symlinked root must fail closed");
+
+        assert!(format!("{error:#}").contains("symlink"));
+        Ok(())
+    }
+
+    #[test]
+    fn read_memory_detail_returns_content_without_a_filesystem_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("notes.md"), "# Notes\n\nDurable fact.")?;
+        let id = scan_memory(temp.path())?.remove(0).id;
+
+        let detail = read_memory_detail(temp.path(), &id)?.expect("memory detail");
+
+        assert_eq!(detail.id, id);
+        assert_eq!(detail.content, "# Notes\n\nDurable fact.");
+        assert_eq!(detail.privacy.classification, None);
+        assert_eq!(detail.privacy.reveal_required, None);
+        assert_eq!(detail.verification.state, "unknown");
+        let json = serde_json::to_value(&detail)?;
+        assert!(json.get("path").is_none());
+        assert!(!json
+            .to_string()
+            .contains(temp.path().to_string_lossy().as_ref()));
+        Ok(())
+    }
+
+    #[test]
+    fn memory_overview_reports_unsupported_capabilities_honestly() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sage = temp.path().join(MEMORY_DIR).join("sage");
+        fs::create_dir_all(&sage)?;
+        fs::write(sage.join("one.md"), "one")?;
+        fs::write(sage.join("two.md"), "two")?;
+
+        let overview = memory_overview(temp.path())?;
+
+        assert_eq!(overview.totals.entries, 2);
+        assert_eq!(overview.totals.familiars, 1);
+        assert_eq!(overview.totals.verified, 0);
+        assert_eq!(overview.totals.needs_review, 0);
+        assert_eq!(overview.totals.unknown, 2);
+        assert!(overview.capabilities.detail);
+        assert!(!overview.capabilities.verification);
+        assert!(!overview.capabilities.attestation_metadata);
+        assert!(!overview.capabilities.supersession_history);
+        assert!(!overview.capabilities.mutations);
+        assert_eq!(overview.verification.state, "unavailable");
+        assert_eq!(overview.verification.manifest, None);
+        assert_eq!(overview.verification.index, None);
         Ok(())
     }
 

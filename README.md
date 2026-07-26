@@ -288,6 +288,11 @@ curl --unix-socket ~/.coven/coven.sock http://localhost/api/v1/health
 
 All API errors use a structured `{ "error": { "code", "message", "details" } }` envelope. Branch on `error.code`, never on `error.message`.
 
+Local dashboards use `GET /api/v1/memory`, `GET /api/v1/memory/overview`,
+and `GET /api/v1/memory/:id`. The daemon resolves and validates memory files;
+clients must not open the archival database, vector index, manifest, or memory
+paths directly.
+
 Treat the socket API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
 
 ---

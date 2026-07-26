@@ -221,6 +221,105 @@ Distinct from the control-plane catalog above, `GET /api/v1/capabilities/harness
 
 Uninstalled harnesses return empty manifests, never errors. Unknown harness ids on `/capabilities/:harnessId` return `404 harness_not_found`. `harnesses` is a reserved path segment, never a harness id. See [Capabilities endpoint](reference/api-capabilities.md) for the full reference.
 
+## Memory dashboard read shapes (`v1`)
+
+The memory read surface is additive to the existing observability list:
+
+- `GET /api/v1/memory` returns summary rows;
+- `GET /api/v1/memory/overview` returns counts and capability state;
+- `GET /api/v1/memory/:id` returns one validated detail row.
+
+The list preserves its original `familiar_id`, `title`, `path`, `updated_at`,
+and `excerpt` fields. `path` is relative to the memory root and exists for CLI
+compatibility; it is never absolute. The opaque UUID `id` is stable while the
+relative file identity is stable. Browser-facing adapters should omit `path`
+from their DTOs.
+
+```json
+[
+  {
+    "id": "d251bc66-3e45-5d03-8d78-1e76919642f9",
+    "familiar_id": "sage",
+    "title": "notes",
+    "path": "sage/notes.md",
+    "updated_at": "4m ago",
+    "updated_at_iso": "2026-07-26T09:56:00Z",
+    "excerpt": "Durable fact.",
+    "privacy_classification": null,
+    "reveal_required": null,
+    "verification_state": "unknown"
+  }
+]
+```
+
+The overview does not translate unavailable metadata into zero or healthy:
+
+```json
+{
+  "generated_at": "2026-07-26T10:00:00Z",
+  "totals": {
+    "entries": 1,
+    "familiars": 1,
+    "verified": 0,
+    "needs_review": 0,
+    "unknown": 1
+  },
+  "last_updated_at": "2026-07-26T09:56:00Z",
+  "capabilities": {
+    "detail": true,
+    "verification": false,
+    "attestation_metadata": false,
+    "supersession_history": false,
+    "mutations": false
+  },
+  "verification": {
+    "state": "unavailable",
+    "checked_at": "2026-07-26T10:00:00Z",
+    "manifest": null,
+    "index": null,
+    "issues": []
+  }
+}
+```
+
+Detail accepts only a UUID returned by the list. It resolves the entry under
+the daemon-owned memory root and returns content without a path:
+
+```json
+{
+  "id": "d251bc66-3e45-5d03-8d78-1e76919642f9",
+  "familiar_id": "sage",
+  "title": "notes",
+  "updated_at": "2026-07-26T09:56:00Z",
+  "source": {
+    "kind": "coven-origin",
+    "label": "Coven origin"
+  },
+  "content": "Durable fact.",
+  "content_format": "markdown",
+  "privacy": {
+    "classification": null,
+    "reveal_required": null,
+    "reason": "privacy taxonomy unavailable"
+  },
+  "verification": {
+    "state": "unknown",
+    "reason": "verification metadata unavailable"
+  },
+  "attestation": null,
+  "supersession": {
+    "supersedes": null,
+    "superseded_by": null
+  }
+}
+```
+
+Malformed ids return `400 invalid_request`; well-formed ids that do not resolve
+return `404 memory_not_found`. Symlinked markdown files are excluded. Until the
+promotion privacy contract provides a classification, clients must treat
+`classification: null` and `reveal_required: null` as requiring explicit
+reveal.
+
 ## Control action shape (`v1`)
 
 `POST /api/v1/actions` accepts a policy-shaped action envelope. The daemon validates the action id before any adapter work is allowed.

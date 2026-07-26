@@ -3656,6 +3656,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bind_tcp_listener_serves_memory_overview_over_tcp() -> Result<()> {
+        use crate::api::NoopSessionRuntime;
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::thread;
+
+        let temp = tempfile::tempdir()?;
+        ensure_private_coven_home(temp.path())?;
+        let memory_dir = temp.path().join("memory").join("sage");
+        std::fs::create_dir_all(&memory_dir)?;
+        std::fs::write(memory_dir.join("notes.md"), "Durable fact.")?;
+        let listener = bind_tcp_listener("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let coven_home = temp.path().to_path_buf();
+        let server = thread::spawn(move || {
+            let runtime = NoopSessionRuntime;
+            serve_next_tcp_connection(&listener, &coven_home, None, &runtime, &[])
+        });
+
+        let mut client = TcpStream::connect(addr)?;
+        client.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        client.write_all(
+            b"GET /api/v1/memory/overview HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+        )?;
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        server.join().expect("server thread")?;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains(r#""entries":1"#), "got: {response}");
+        assert!(response.contains(r#""detail":true"#), "got: {response}");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bind_tcp_listener_rejects_non_loopback() {
         let error = bind_tcp_listener("0.0.0.0:0").expect_err("should reject wildcard bind");
         let msg = format!("{error:#}");
@@ -4435,6 +4471,36 @@ mod tests {
         assert!(response.contains(r#""ok":true"#));
         assert!(response.contains(r#""apiVersion":"coven.daemon.v1""#));
         assert!(response.contains(r#""pid":12345"#));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serves_memory_overview_over_unix_socket() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+
+        let temp_dir = tempfile::tempdir()?;
+        let memory_dir = temp_dir.path().join("memory").join("sage");
+        std::fs::create_dir_all(&memory_dir)?;
+        std::fs::write(memory_dir.join("notes.md"), "Durable fact.")?;
+        let listener = bind_api_socket(temp_dir.path())?;
+        let home = temp_dir.path().to_path_buf();
+        let runtime = LiveSessionRuntime::default();
+        let server = thread::spawn(move || serve_next_connection(&listener, &home, None, &runtime));
+
+        let mut stream = UnixStream::connect(daemon_socket_path(temp_dir.path()))?;
+        stream.write_all(b"GET /api/v1/memory/overview HTTP/1.1\r\nHost: coven\r\n\r\n")?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        server.join().expect("server thread panicked")?;
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+        assert!(response.contains(r#""entries":1"#), "got: {response}");
+        assert!(response.contains(r#""detail":true"#), "got: {response}");
         Ok(())
     }
 

@@ -495,6 +495,24 @@ pub fn handle_request_with_runtime(
             }
         }
 
+        ("GET", "/memory/overview") => {
+            json_response(200, &crate::cockpit_sources::memory_overview(coven_home)?)
+        }
+        ("GET", path) if path.starts_with("/memory/") => {
+            let id = path.trim_start_matches("/memory/");
+            if id.contains('/') || Uuid::parse_str(id).is_err() {
+                return api_error(400, "invalid_request", "Memory id must be a UUID.", None);
+            }
+            match crate::cockpit_sources::read_memory_detail(coven_home, id)? {
+                Some(detail) => json_response(200, &detail),
+                None => api_error(
+                    404,
+                    "memory_not_found",
+                    "Memory entry was not found.",
+                    Some(serde_json::json!({ "memoryId": id })),
+                ),
+            }
+        }
         ("GET", "/memory") => json_response(200, &crate::cockpit_sources::scan_memory(coven_home)?),
         ("GET", "/research") => {
             json_response(200, &crate::cockpit_sources::read_research(coven_home)?)
@@ -8062,6 +8080,74 @@ description = "digs deep"
             assert_eq!(response.status, 200, "route {route}");
             assert_eq!(response.content_type, "application/json", "route {route}");
             assert_eq!(response.body, "[]", "route {route}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn memory_overview_route_reports_capabilities_and_opaque_list_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        assert_eq!(list.status, 200);
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+        assert!(Uuid::parse_str(id).is_ok());
+        assert_eq!(entries[0]["path"], "sage/notes.md");
+        assert_eq!(entries[0]["verification_state"], "unknown");
+        assert!(!list.body.contains(home.to_string_lossy().as_ref()));
+
+        let response = handle_request("GET", "/api/v1/memory/overview", home, None)?;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["totals"]["entries"], 1);
+        assert_eq!(body["capabilities"]["detail"], true);
+        assert_eq!(body["capabilities"]["verification"], false);
+        assert_eq!(body["verification"]["state"], "unavailable");
+        Ok(())
+    }
+
+    #[test]
+    fn memory_detail_route_returns_content_and_rejects_invalid_ids() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let sage = home.join("memory").join("sage");
+        std::fs::create_dir_all(&sage)?;
+        std::fs::write(sage.join("notes.md"), "Durable fact.")?;
+        let list = handle_request("GET", "/api/v1/memory", home, None)?;
+        let entries: serde_json::Value = serde_json::from_str(&list.body)?;
+        let id = entries[0]["id"].as_str().expect("opaque id");
+
+        let found = handle_request("GET", &format!("/api/v1/memory/{id}"), home, None)?;
+        assert_eq!(found.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&found.body)?;
+        assert_eq!(body["content"], "Durable fact.");
+        assert!(body.get("path").is_none());
+        assert!(!found.body.contains(home.to_string_lossy().as_ref()));
+
+        let missing = handle_request(
+            "GET",
+            "/api/v1/memory/00000000-0000-0000-0000-000000000000",
+            home,
+            None,
+        )?;
+        assert_eq!(missing.status, 404);
+        let missing_body: serde_json::Value = serde_json::from_str(&missing.body)?;
+        assert_eq!(missing_body["error"]["code"], "memory_not_found");
+
+        for path in [
+            "/api/v1/memory/not-a-uuid",
+            "/api/v1/memory/a/b",
+            "/api/v1/memory/",
+        ] {
+            let invalid = handle_request("GET", path, home, None)?;
+            assert_eq!(invalid.status, 400, "path {path}");
+            let invalid_body: serde_json::Value = serde_json::from_str(&invalid.body)?;
+            assert_eq!(invalid_body["error"]["code"], "invalid_request");
         }
         Ok(())
     }
