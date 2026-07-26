@@ -613,7 +613,7 @@ enum AdapterCommand {
     },
     #[command(about = "Install a trusted local adapter recipe")]
     Install {
-        #[arg(help = "Adapter recipe to install, e.g. hermes")]
+        #[arg(help = "Adapter recipe to install")]
         adapter: String,
     },
 }
@@ -4956,6 +4956,28 @@ mod tests {
                 .any(|token| token == "--add-dir" || token.starts_with("--add-dir <"))),
             "run --help must advertise --add-dir for Cave's capability probe:\n{help}"
         );
+    }
+
+    #[test]
+    fn adapter_install_help_does_not_duplicate_the_recipe_registry() {
+        use clap::CommandFactory;
+
+        let mut cmd = Cli::command();
+        let adapter = cmd
+            .find_subcommand_mut("adapter")
+            .expect("adapter subcommand exists");
+        let install = adapter
+            .find_subcommand_mut("install")
+            .expect("adapter install subcommand exists");
+        let help = install.render_long_help().to_string();
+
+        assert!(help.contains("Adapter recipe to install"));
+        for recipe in harness::known_adapter_recipe_names() {
+            assert!(
+                !help.contains(recipe),
+                "adapter install help must not hardcode recipe `{recipe}`:\n{help}"
+            );
+        }
     }
 
     #[test]
