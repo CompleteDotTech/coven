@@ -224,6 +224,11 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             },
             edits,
             now,
+            StagingProbeContext {
+                workspace,
+                config,
+                authorization,
+            },
         )?;
         GateOutcome::Staged {
             pending_path,
@@ -396,6 +401,16 @@ pub(crate) fn familiar_weave_id(familiar_id: &str) -> threads::FamiliarId {
 /// directories included), and the read is capped so a pathological
 /// declaration cannot balloon memory.
 pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
+    Ok(read_surface_if_exists(workspace, surface)?.unwrap_or_default())
+}
+
+/// The confined surface read with file absence preserved.
+///
+/// Probe evidence needs to distinguish an absent baseline from an existing
+/// empty file so a later approval can detect either state changing. The
+/// authority weave keeps its historical absent-as-empty convention through
+/// [`read_surface`].
+pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<Option<Vec<u8>>> {
     const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
 
     if surface.starts_with('/') || surface.starts_with('\\') {
@@ -416,12 +431,9 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
     // component, so canonicalize the deepest *existing* ancestor and require
     // it to stay inside the canonical workspace (second review pass finding —
     // `linkdir/secret` with `linkdir` pointing outside must refuse).
-    let canonical_workspace = workspace.canonicalize().with_context(|| {
-        format!(
-            "familiar workspace `{}` is not resolvable",
-            workspace.display()
-        )
-    })?;
+    let canonical_workspace = workspace
+        .canonicalize()
+        .with_context(|| format!("familiar workspace for surface `{surface}` is not resolvable"))?;
     let mut ancestor = path.parent();
     let deepest_existing = loop {
         match ancestor {
@@ -431,9 +443,8 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
                     ancestor = candidate.parent();
                 }
                 Err(err) => {
-                    return Err(err).with_context(|| {
-                        format!("resolving ancestor of surface {}", path.display())
-                    })
+                    return Err(err)
+                        .with_context(|| format!("resolving ancestor of surface `{surface}`"))
                 }
             },
             None => break None,
@@ -451,10 +462,8 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
         Ok(metadata) => metadata,
         // An absent protected file baselines as empty: creating it later is
         // drift like any other content change.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("inspecting surface {}", path.display()))
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("inspecting surface `{surface}`")),
     };
     // Only regular files are hashable surfaces; a symlinked or special-file
     // surface is refused rather than followed out of the workspace.
@@ -466,7 +475,9 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
             "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
         );
     }
-    std::fs::read(&path).with_context(|| format!("reading surface {}", path.display()))
+    std::fs::read(&path)
+        .map(Some)
+        .with_context(|| format!("reading surface `{surface}`"))
 }
 
 fn load_or_create_manifest_id(conn: &Connection, familiar_id: &str) -> Result<threads::ManifestId> {
@@ -748,6 +759,11 @@ pub fn stage_coherence_proposal(
         },
         edits,
         now,
+        StagingProbeContext {
+            workspace,
+            config,
+            authorization,
+        },
     )?;
 
     let files_touched = serde_json::to_string(
@@ -792,6 +808,12 @@ struct StagingLane {
     review_kind: Option<&'static str>,
 }
 
+struct StagingProbeContext<'a> {
+    workspace: &'a Path,
+    config: &'a ward::WardConfig,
+    authorization: &'a ward::Authorization,
+}
+
 fn stage_pending_proposal(
     coven_home: &Path,
     familiar_uuid: &threads::FamiliarId,
@@ -799,6 +821,7 @@ fn stage_pending_proposal(
     lane: StagingLane,
     edits: &[ward::FileEdit],
     now: time::OffsetDateTime,
+    probe_context: StagingProbeContext<'_>,
 ) -> Result<(PathBuf, String)> {
     let proposal = threads::PendingProposal {
         id: threads::ProposalId::new(),
@@ -816,25 +839,34 @@ fn stage_pending_proposal(
             .collect(),
         staged_at: now,
     };
+    let probes = crate::ward_probes::run_at_staging(
+        probe_context.workspace,
+        probe_context.config,
+        edits,
+        probe_context.authorization,
+    )
+    .context("running deterministic Ward probes")?;
 
     let pending_dir = coven_home.join("pending");
     std::fs::create_dir_all(&pending_dir)
         .with_context(|| format!("creating {}", pending_dir.display()))?;
     let path = pending_dir.join(proposal.file_name());
     let body = {
-        /// On-disk pending-proposal shape: the core type plus the optional
-        /// lane marker (absent ⇒ authority, so existing files and the core
-        /// deserializer keep working unchanged).
+        /// On-disk pending-proposal shape: the core type plus additive lane
+        /// and probe-evidence sidecars. An absent lane still means authority;
+        /// existing files and the core deserializer keep working unchanged.
         #[derive(serde::Serialize)]
         struct StagedProposalFile<'a> {
             #[serde(flatten)]
             proposal: &'a threads::PendingProposal,
             #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
             review_kind: Option<&'static str>,
+            probes: &'a [crate::ward_probes::SurfaceProbeReport],
         }
         serde_json::to_vec_pretty(&StagedProposalFile {
             proposal: &proposal,
             review_kind: lane.review_kind,
+            probes: &probes,
         })
         .context("serializing pending proposal")?
     };
@@ -1080,8 +1112,17 @@ tier = 2
             panic!("expected Staged, got {report:?}");
         };
         assert!(pending_path.exists(), "pending file must exist");
-        let staged: threads::PendingProposal =
-            serde_json::from_slice(&std::fs::read(pending_path).unwrap()).unwrap();
+        let raw = std::fs::read(pending_path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(value["probes"][0]["target"], "SOUL.md");
+        assert_eq!(value["probes"][0]["surface"], "SOUL.md");
+        assert_eq!(value["probes"][0]["status"], "unscored");
+        assert_eq!(value["probes"][0]["results"], serde_json::json!([]));
+        assert_eq!(
+            value["probes"][0]["baselineSha256"].as_str().map(str::len),
+            Some(64)
+        );
+        let staged: threads::PendingProposal = serde_json::from_slice(&raw).unwrap();
         assert_eq!(staged.edits.len(), 1);
         assert!(matches!(
             staged.fray,
@@ -1292,6 +1333,37 @@ tier = 0
         )
         .expect_err("symlinked surface must refuse");
         assert!(format!("{err:#}").contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn surface_read_errors_name_only_the_logical_surface() {
+        let f = fixture();
+        let missing_workspace = f.workspace.join("missing-workspace");
+        let missing_error = read_surface_if_exists(&missing_workspace, "reviewed/file.md")
+            .expect_err("a missing workspace must refuse");
+        let missing_rendered = format!("{missing_error:#}");
+
+        assert!(
+            missing_rendered.contains("reviewed/file.md"),
+            "{missing_rendered}"
+        );
+        assert!(
+            !missing_rendered.contains(&missing_workspace.display().to_string()),
+            "{missing_rendered}"
+        );
+
+        std::os::unix::fs::symlink("loop", f.workspace.join("loop")).unwrap();
+
+        let error = read_surface_if_exists(&f.workspace, "loop/file.md")
+            .expect_err("a symlink loop must refuse");
+        let rendered = format!("{error:#}");
+
+        assert!(rendered.contains("loop/file.md"), "{rendered}");
+        assert!(
+            !rendered.contains(&f.workspace.display().to_string()),
+            "{rendered}"
+        );
     }
 
     #[cfg(unix)]
