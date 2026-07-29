@@ -1,6 +1,7 @@
 pub mod config;
 pub mod contract;
 pub mod identity;
+pub mod pairing;
 pub mod registry;
 
 use std::net::SocketAddr;

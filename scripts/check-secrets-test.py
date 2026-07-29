@@ -405,6 +405,47 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [("docs/example.md", 1, "high_entropy")])
 
+    def test_labeled_synthetic_mobile_signature_vector_is_allowed_only_at_exact_path(
+        self,
+    ) -> None:
+        token = (
+            "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_"
+            "AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo"
+        )
+        line = f'"publicKeyX963": "{token}"'
+
+        self.assertEqual(
+            check_secrets.scan_text(
+                line,
+                "crates/coven-cli/tests/fixtures/mobile-memory-v1/signature-vector.json",
+            ),
+            [],
+        )
+        self.assertEqual(
+            check_secrets.scan_text(line, "docs/example.json"),
+            [("docs/example.json", 1, "high_entropy")],
+        )
+        canonical = (
+            '"canonical": "COVEN-MEMORY/1\\nGET\\n/path\\n'
+            '47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"'
+        )
+        self.assertEqual(
+            check_secrets.scan_text(
+                canonical,
+                "crates/coven-cli/tests/fixtures/mobile-memory-v1/signature-vector.json",
+            ),
+            [],
+        )
+
+    def test_synthetic_p256_test_key_binding_is_not_a_literal_secret(self) -> None:
+        line = "let secret = p256::SecretKey::from_slice(&scalar).unwrap();"
+        self.assertEqual(
+            check_secrets.scan_text(
+                line, "crates/coven-cli/src/mobile_memory/registry.rs"
+            ),
+            [],
+        )
+
     def test_screaming_snake_constant_method_call_is_not_a_secret(self) -> None:
         text = (
             "            kind: CAST_QUEST_PHASE_COMPLETED_KIND.to_string(),\n"

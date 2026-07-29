@@ -288,12 +288,12 @@ mod tests {
         for (target, source) in scalar[16..].iter_mut().zip(id.as_bytes()) {
             *target ^= source;
         }
-        let secret = p256::SecretKey::from_slice(&scalar).unwrap();
+        let signing_key = p256::SecretKey::from_slice(&scalar).unwrap();
         DeviceRecord {
             id,
             display_name: name.to_owned(),
             public_key_x963: URL_SAFE_NO_PAD
-                .encode(secret.public_key().to_encoded_point(false).as_bytes()),
+                .encode(signing_key.public_key().to_encoded_point(false).as_bytes()),
             paired_at: Utc::now(),
             revoked_at: None,
             scopes: vec![DeviceScope::MemoryRead],

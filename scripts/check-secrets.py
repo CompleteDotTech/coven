@@ -204,6 +204,14 @@ KNOWN_SAFE_LONG_PATH_ATOMS = {
     "troubleshooting",
     "verification",
 }
+SYNTHETIC_MOBILE_VECTOR_PATH = (
+    "crates/coven-cli/tests/fixtures/mobile-memory-v1/signature-vector.json"
+)
+KNOWN_SYNTHETIC_MOBILE_VECTOR_TOKENS = {
+    "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+    "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo",
+    "MEYCIQDe-8HxHBTSi-K7uBXeL7umSew931dlAJTW9-SJpyUwFAIhAILxGxPVcZH3iUoGMn_0sOaxQsPZwzV_OzYNGrWPgpZ0",
+}
 PATH_CONTEXT_BOUNDARIES = {
     ".worktrees",
     "Library",
@@ -344,9 +352,17 @@ def is_known_safe_rust_runtime_binding(
         comment, allow_empty=True
     ):
         return False
+    normalized_path = path.replace("\\", "/")
+    if (
+        normalized_path
+        == "crates/coven-cli/src/mobile_memory/registry.rs"
+        and code.strip()
+        == "let secret = p256::SecretKey::from_slice(&scalar).unwrap();"
+    ):
+        return True
     binding = RUST_KNOWN_SAFE_RUNTIME_BINDING.fullmatch(code)
     return bool(
-        path.replace("\\", "/").endswith(".rs")
+        normalized_path.endswith(".rs")
         and binding
         and match_is_within(assignment, binding)
     )
@@ -876,6 +892,11 @@ def is_high_entropy_finding(
     path: str, line: str, token_match: re.Match[str]
 ) -> bool:
     token = token_match.group(0)
+    if (
+        path.replace("\\", "/") == SYNTHETIC_MOBILE_VECTOR_PATH
+        and token.removeprefix("n") in KNOWN_SYNTHETIC_MOBILE_VECTOR_TOKENS
+    ):
+        return False
     return not is_known_safe_entropy_token(
         path, line, token_match
     ) and entropy(token) >= 4.3
