@@ -1,15 +1,24 @@
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod contract;
+pub mod gateway;
 pub mod identity;
 pub mod pairing;
 pub mod registry;
 
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::{
+    io::{Read, Write},
+    path::Path,
+    thread,
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 
@@ -149,10 +158,133 @@ pub fn run_revoke_device(device_id: Uuid) -> Result<()> {
     let registry = registry::DeviceRegistry::load_if_present(&coven_home)?
         .context("no mobile devices are paired")?;
     registry.revoke(device_id, Utc::now())?;
+    audit::append_event(
+        &coven_home,
+        Utc::now(),
+        audit::MobileAuditEvent::DeviceRevoked,
+        Some(device_id),
+    )?;
     println!("Revoked mobile device {device_id}.");
     Ok(())
 }
 
 pub fn run_pair() -> Result<()> {
-    bail!("mobile pairing is not available until the mobile gateway is running")
+    #[cfg(not(unix))]
+    {
+        bail!("mobile pairing control is not implemented on this platform")
+    }
+    #[cfg(unix)]
+    {
+        run_pair_unix()
+    }
+}
+
+#[cfg(unix)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPairingInvitation {
+    id: Uuid,
+    terminal_output: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[cfg(unix)]
+#[derive(Deserialize)]
+struct LocalPairingStatus {
+    phrase: Option<[String; 6]>,
+}
+
+#[cfg(unix)]
+fn run_pair_unix() -> Result<()> {
+    let coven_home = crate::coven_home_dir()?;
+    let (status, body) =
+        post_mobile_control(&coven_home, "/api/v1/internal/mobile/pairings", "{}")?;
+    if status != 201 {
+        bail!("Coven daemon rejected mobile pairing with HTTP {status}: {body}");
+    }
+    let invitation: LocalPairingInvitation =
+        serde_json::from_str(&body).context("daemon returned an invalid pairing invitation")?;
+    println!("{}", invitation.terminal_output);
+
+    let phrase = loop {
+        if Utc::now() >= invitation.expires_at {
+            bail!("mobile pairing expired before the device enrolled");
+        }
+        let path = format!("/api/v1/internal/mobile/pairings/{}/status", invitation.id);
+        let (status, body) = post_mobile_control(&coven_home, &path, "{}")?;
+        if status != 200 {
+            bail!("Coven daemon rejected pairing status with HTTP {status}: {body}");
+        }
+        let status: LocalPairingStatus =
+            serde_json::from_str(&body).context("daemon returned invalid pairing status")?;
+        if let Some(phrase) = status.phrase {
+            break phrase;
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+
+    println!("\nCompare these words with the device:");
+    for (index, word) in phrase.iter().enumerate() {
+        println!("{}. {word}", index + 1);
+    }
+    println!("Type `confirm` only if all six words match:");
+    let mut confirmation = String::new();
+    std::io::stdin()
+        .read_line(&mut confirmation)
+        .context("failed to read pairing confirmation")?;
+    if confirmation.trim() != "confirm" {
+        bail!("mobile pairing cancelled without host confirmation");
+    }
+    let path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
+    let body = serde_json::json!({ "phrase": phrase }).to_string();
+    let (status, response) = post_mobile_control(&coven_home, &path, &body)?;
+    match status {
+        200 => {
+            println!("Mobile device paired.");
+            Ok(())
+        }
+        409 => {
+            println!("Host confirmed. Complete confirmation on the device before it expires.");
+            Ok(())
+        }
+        _ => bail!("Coven daemon rejected host confirmation with HTTP {status}: {response}"),
+    }
+}
+
+#[cfg(unix)]
+fn post_mobile_control(coven_home: &Path, path: &str, body: &str) -> Result<(u16, String)> {
+    use std::os::unix::net::UnixStream;
+
+    let socket = crate::daemon::daemon_socket_path(coven_home);
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut stream = UnixStream::connect(&socket).with_context(|| {
+        format!(
+            "failed to connect to Coven daemon socket {}; start or restart the daemon after enabling mobile memory",
+            socket.display()
+        )
+    })?;
+    stream
+        .write_all(request.as_bytes())
+        .context("failed to write mobile pairing control request")?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .context("failed to finish mobile pairing control request")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("failed to read mobile pairing control response")?;
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok())
+        .context("invalid mobile pairing control response")?;
+    let (_, body) = response
+        .split_once("\r\n\r\n")
+        .context("mobile pairing control response omitted a body")?;
+    Ok((status, body.to_owned()))
 }

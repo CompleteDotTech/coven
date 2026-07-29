@@ -2236,6 +2236,8 @@ pub fn serve_forever(
         status_path: status_path.clone(),
         pid: status.pid,
     };
+    let _mobile_gateway =
+        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
     append_daemon_recovery_log(
         coven_home,
         &format!(
@@ -2421,14 +2423,21 @@ where
     }
     let body = read_http_body(&mut reader, headers.content_length)?;
     let (method, path) = parse_request_line(&request_line)?;
-    let response = match crate::api::handle_request_with_runtime(
-        method,
-        path,
-        coven_home,
-        status,
-        body.as_deref(),
-        runtime,
-    ) {
+    let local_control = if matches!(guard, HostGuard::Disabled) {
+        crate::mobile_memory::gateway::handle_local_control(method, path, body.as_deref())
+    } else {
+        None
+    };
+    let response = match local_control.unwrap_or_else(|| {
+        crate::api::handle_request_with_runtime(
+            method,
+            path,
+            coven_home,
+            status,
+            body.as_deref(),
+            runtime,
+        )
+    }) {
         Ok(response) => response,
         Err(error) => {
             append_daemon_recovery_log(
@@ -2753,6 +2762,8 @@ pub fn serve_forever(
         .security_descriptor(security_descriptor)
         .create_sync()
         .context("failed to bind Windows named pipe")?;
+    let _mobile_gateway =
+        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
 
     // Claim the pipe before mutating shared daemon/session state. A duplicate
     // daemon must fail at bind without replacing the incumbent's daemon.json

@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::config::{atomic_create_private, ensure_private_mobile_dir, validate_private_file};
+use super::config::{
+    atomic_create_private, atomic_replace_private, ensure_private_mobile_dir, validate_private_file,
+};
 
 const HOST_IDENTITY_FILE: &str = "host-identity.json";
 const HOST_KEY_FILE: &str = "host-key.pem";
@@ -28,6 +30,8 @@ pub struct HostIdentity {
 struct StoredHostIdentity {
     certificate_pem: String,
     public_key_fingerprint: String,
+    #[serde(default)]
+    subject_alt_name: String,
 }
 
 pub fn load_or_create_host_identity(
@@ -42,7 +46,20 @@ pub fn load_or_create_host_identity(
     let identity_path = mobile_dir.join(HOST_IDENTITY_FILE);
 
     let certificate_der = match fs::symlink_metadata(&identity_path) {
-        Ok(_) => load_stored_certificate(&identity_path, public_key_fingerprint)?,
+        Ok(_) => {
+            let (certificate, stored_name) =
+                load_stored_certificate(&identity_path, public_key_fingerprint)?;
+            if stored_name == subject_alt_name {
+                certificate
+            } else {
+                replace_certificate(
+                    &identity_path,
+                    &key_pair,
+                    subject_alt_name,
+                    public_key_fingerprint,
+                )?
+            }
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => create_or_load_certificate(
             &identity_path,
             &key_pair,
@@ -110,6 +127,7 @@ fn create_or_load_certificate(
     let stored = StoredHostIdentity {
         certificate_pem: certificate.pem(),
         public_key_fingerprint: URL_SAFE_NO_PAD.encode(public_key_fingerprint),
+        subject_alt_name: subject_alt_name.to_owned(),
     };
     let mut encoded =
         serde_json::to_vec_pretty(&stored).context("failed to encode mobile host identity")?;
@@ -118,11 +136,45 @@ fn create_or_load_certificate(
     if atomic_create_private(path, &encoded)? {
         Ok(certificate.der().to_vec())
     } else {
-        load_stored_certificate(path, public_key_fingerprint)
+        let (certificate, stored_name) = load_stored_certificate(path, public_key_fingerprint)?;
+        if stored_name == subject_alt_name {
+            Ok(certificate)
+        } else {
+            replace_certificate(path, key_pair, subject_alt_name, public_key_fingerprint)
+        }
     }
 }
 
-fn load_stored_certificate(path: &Path, expected_fingerprint: [u8; 32]) -> Result<Vec<u8>> {
+fn replace_certificate(
+    path: &Path,
+    key_pair: &KeyPair,
+    subject_alt_name: &str,
+    public_key_fingerprint: [u8; 32],
+) -> Result<Vec<u8>> {
+    let mut params = CertificateParams::new(vec![subject_alt_name.to_owned()])
+        .context("failed to configure mobile host certificate")?;
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, "Coven Memory");
+    params.distinguished_name = distinguished_name;
+    let certificate = params
+        .self_signed(key_pair)
+        .context("failed to create mobile host certificate")?;
+    let stored = StoredHostIdentity {
+        certificate_pem: certificate.pem(),
+        public_key_fingerprint: URL_SAFE_NO_PAD.encode(public_key_fingerprint),
+        subject_alt_name: subject_alt_name.to_owned(),
+    };
+    let mut encoded =
+        serde_json::to_vec_pretty(&stored).context("failed to encode mobile host identity")?;
+    encoded.push(b'\n');
+    atomic_replace_private(path, &encoded)?;
+    Ok(certificate.der().to_vec())
+}
+
+fn load_stored_certificate(
+    path: &Path,
+    expected_fingerprint: [u8; 32],
+) -> Result<(Vec<u8>, String)> {
     validate_private_file(path)?;
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     let stored: StoredHostIdentity = serde_json::from_slice(&bytes)
@@ -141,7 +193,7 @@ fn load_stored_certificate(path: &Path, expected_fingerprint: [u8; 32]) -> Resul
     if certificates.len() != 1 {
         bail!("mobile host identity must contain exactly one certificate");
     }
-    Ok(certificates[0].as_ref().to_vec())
+    Ok((certificates[0].as_ref().to_vec(), stored.subject_alt_name))
 }
 
 #[cfg(test)]
@@ -179,5 +231,19 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn endpoint_change_reissues_certificate_without_rotating_host_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = load_or_create_host_identity(temp.path(), "192.168.1.10").unwrap();
+        let second = load_or_create_host_identity(temp.path(), "192.168.1.11").unwrap();
+
+        assert_ne!(first.certificate_der, second.certificate_der);
+        assert_eq!(first.public_key_fingerprint, second.public_key_fingerprint);
+        assert_eq!(
+            first.private_key_der.as_slice(),
+            second.private_key_der.as_slice()
+        );
     }
 }

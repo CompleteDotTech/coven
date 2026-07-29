@@ -43,7 +43,8 @@ pub struct PairingInvitation {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EnrolledPairing {
     pub id: Uuid,
     pub phrase: [String; 6],
@@ -179,6 +180,25 @@ impl PairingManager {
         })
     }
 
+    pub fn enroll_by_nonce(
+        &self,
+        nonce: [u8; 32],
+        request: MobilePairingRequest,
+        host_fingerprint: [u8; 32],
+        now: DateTime<Utc>,
+    ) -> Result<EnrolledPairing, PairingError> {
+        let nonce_hash: [u8; 32] = Sha256::digest(nonce).into();
+        let pairing_id = self
+            .pending
+            .lock()
+            .map_err(|_| PairingError::InvalidRequest)?
+            .values()
+            .find(|pairing| pairing.nonce_hash == nonce_hash)
+            .map(|pairing| pairing.id)
+            .ok_or(PairingError::PairingConsumed)?;
+        self.enroll(pairing_id, nonce, request, host_fingerprint, now)
+    }
+
     pub fn confirm_host(
         &self,
         pairing_id: Uuid,
@@ -195,6 +215,25 @@ impl PairingManager {
         now: DateTime<Utc>,
     ) -> Result<PairingProgress, PairingError> {
         self.confirm(pairing_id, phrase, now, false)
+    }
+
+    pub fn phrase(
+        &self,
+        pairing_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<Option<[String; 6]>, PairingError> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| PairingError::InvalidRequest)?;
+        let pairing = pending
+            .get(&pairing_id)
+            .ok_or(PairingError::PairingConsumed)?;
+        if now >= pairing.expires_at {
+            pending.remove(&pairing_id);
+            return Err(PairingError::PairingExpired);
+        }
+        Ok(pairing.transcript_hash.map(phrase_for_hash))
     }
 
     fn confirm(

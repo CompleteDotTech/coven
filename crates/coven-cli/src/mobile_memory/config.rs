@@ -107,6 +107,11 @@ fn is_private_mobile_address(address: IpAddr) -> bool {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn is_private_mobile_address_for_test(address: IpAddr) -> bool {
+    is_private_mobile_address(address)
+}
+
 fn is_tailnet_address(address: Ipv4Addr) -> bool {
     let octets = address.octets();
     octets[0] == 100 && (64..=127).contains(&octets[1])
@@ -117,6 +122,16 @@ fn is_unique_local(address: Ipv6Addr) -> bool {
 }
 
 pub fn load_mobile_config(coven_home: &Path) -> Result<Option<MobileGatewayConfig>> {
+    let config = load_mobile_config_unvalidated(coven_home)?;
+    if let Some(config) = &config {
+        validate_mobile_config(config)?;
+    }
+    Ok(config)
+}
+
+pub(crate) fn load_mobile_config_unvalidated(
+    coven_home: &Path,
+) -> Result<Option<MobileGatewayConfig>> {
     let mobile_dir = coven_home.join(MOBILE_STATE_DIR);
     match fs::symlink_metadata(&mobile_dir) {
         Ok(_) => validate_private_directory(&mobile_dir)?,
@@ -139,7 +154,6 @@ pub fn load_mobile_config(coven_home: &Path) -> Result<Option<MobileGatewayConfi
     let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let config: MobileGatewayConfig = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    validate_mobile_config(&config)?;
     Ok(Some(config))
 }
 
