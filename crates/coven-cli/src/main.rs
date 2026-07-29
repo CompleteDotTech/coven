@@ -107,7 +107,7 @@ impl Cli {
         if matches!(
             self.command,
             Some(Command::Memory {
-                command: Some(MemoryCommand::Open),
+                command: Some(_),
                 json: true,
             })
         ) {
@@ -509,6 +509,52 @@ enum Command {
 enum MemoryCommand {
     #[command(about = "Open the private local memory dashboard")]
     Open,
+    #[command(about = "Manage opt-in mobile memory access")]
+    Mobile {
+        #[command(subcommand)]
+        command: MobileMemoryCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MobileMemoryCommand {
+    #[command(about = "Enable the private-network TLS mobile gateway")]
+    Enable {
+        #[arg(long, value_name = "PRIVATE_ADDRESS:PORT")]
+        bind: std::net::SocketAddr,
+        #[arg(long, value_name = "HTTPS_URL")]
+        endpoint: String,
+    },
+    #[command(about = "Disable the mobile gateway while retaining pairing state")]
+    Disable {
+        #[arg(long, requires = "confirm_forget_devices")]
+        forget_devices: bool,
+        #[arg(long, requires = "forget_devices")]
+        confirm_forget_devices: bool,
+    },
+    #[command(about = "Show mobile gateway status")]
+    Status {
+        #[arg(long, help = "Print status as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Start a short-lived mobile pairing session")]
+    Pair,
+    #[command(about = "List or revoke paired mobile devices")]
+    Devices {
+        #[command(subcommand)]
+        command: Option<MobileDeviceCommand>,
+        #[arg(long, help = "Print devices as JSON (machine-readable)")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MobileDeviceCommand {
+    #[command(about = "Revoke a paired device")]
+    Revoke {
+        #[arg(value_name = "DEVICE_ID")]
+        device_id: Uuid,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1018,6 +1064,23 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Skills { json }) => observe::run_skills(json),
         Some(Command::Memory { command, json }) => match command {
             Some(MemoryCommand::Open) => memory_dashboard::run_open(),
+            Some(MemoryCommand::Mobile { command }) => match command {
+                MobileMemoryCommand::Enable { bind, endpoint } => {
+                    mobile_memory::run_enable(bind, &endpoint)
+                }
+                MobileMemoryCommand::Disable {
+                    forget_devices,
+                    confirm_forget_devices,
+                } => mobile_memory::run_disable(forget_devices, confirm_forget_devices),
+                MobileMemoryCommand::Status { json } => mobile_memory::run_status(json),
+                MobileMemoryCommand::Pair => mobile_memory::run_pair(),
+                MobileMemoryCommand::Devices { command, json } => match command {
+                    Some(MobileDeviceCommand::Revoke { device_id }) => {
+                        mobile_memory::run_revoke_device(device_id)
+                    }
+                    None => mobile_memory::run_devices(json),
+                },
+            },
             None => observe::run_memory(json),
         },
         Some(Command::Research { json }) => observe::run_research(json),
@@ -4248,6 +4311,54 @@ mod tests {
                     json: false
                 })
             ));
+        }
+    }
+
+    #[test]
+    fn memory_mobile_cli_parses_required_commands() {
+        for args in [
+            vec![
+                "coven",
+                "memory",
+                "mobile",
+                "enable",
+                "--bind",
+                "192.168.1.10:7443",
+                "--endpoint",
+                "https://192.168.1.10:7443",
+            ],
+            vec!["coven", "memory", "mobile", "disable"],
+            vec!["coven", "memory", "mobile", "status", "--json"],
+            vec!["coven", "memory", "mobile", "pair"],
+            vec!["coven", "memory", "mobile", "devices", "--json"],
+            vec![
+                "coven",
+                "memory",
+                "mobile",
+                "devices",
+                "revoke",
+                "00000000-0000-0000-0000-000000000001",
+            ],
+        ] {
+            Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .expect("required memory mobile command must parse");
+        }
+
+        for args in [
+            vec!["coven", "memory", "mobile", "disable", "--forget-devices"],
+            vec![
+                "coven",
+                "memory",
+                "mobile",
+                "disable",
+                "--confirm-forget-devices",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "device erasure must require both confirmation flags"
+            );
         }
     }
 

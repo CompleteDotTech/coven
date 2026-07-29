@@ -152,6 +152,29 @@ pub fn save_mobile_config(coven_home: &Path, config: &MobileGatewayConfig) -> Re
     atomic_replace_private(&mobile_dir.join(GATEWAY_CONFIG_FILE), &encoded)
 }
 
+pub fn remove_mobile_config(coven_home: &Path) -> Result<bool> {
+    let mobile_dir = coven_home.join(MOBILE_STATE_DIR);
+    match fs::symlink_metadata(&mobile_dir) {
+        Ok(_) => validate_private_directory(&mobile_dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", mobile_dir.display()));
+        }
+    }
+    let path = mobile_dir.join(GATEWAY_CONFIG_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => validate_private_file(&path)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    sync_directory(&mobile_dir)?;
+    Ok(true)
+}
+
 pub(crate) fn ensure_private_mobile_dir(coven_home: &Path) -> Result<PathBuf> {
     let path = coven_home.join(MOBILE_STATE_DIR);
     match fs::symlink_metadata(&path) {
