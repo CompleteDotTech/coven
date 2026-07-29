@@ -1,0 +1,31 @@
+{
+  "ok": true,
+  "protocolVersion": 1,
+  "requestId": "01J00000000000000000000004",
+  "data": {
+    "id": "00000000-0000-0000-0000-000000000002",
+    "familiarId": "echo",
+    "title": "Synthetic protected note",
+    "updatedAt": "2026-07-29T11:00:00Z",
+    "source": {
+      "kind": "coven-origin",
+      "label": "Coven origin"
+    },
+    "content": "# Synthetic protected note\n\nSynthetic protected content only.",
+    "contentFormat": "markdown",
+    "privacy": {
+      "classification": null,
+      "revealRequired": true,
+      "reason": "Synthetic classification requires explicit reveal."
+    },
+    "verification": {
+      "state": "needs-review",
+      "reason": "Synthetic fixture requires review."
+    },
+    "attestationMetadata": null,
+    "supersession": {
+      "supersedes": "00000000-0000-0000-0000-000000000001",
+      "supersededBy": null
+    }
+  }
+}

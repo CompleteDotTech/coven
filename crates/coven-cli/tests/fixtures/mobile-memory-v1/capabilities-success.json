@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "protocolVersion": 1,
+  "requestId": "01J00000000000000000000000",
+  "data": {
+    "minimumProtocolVersion": 1,
+    "currentProtocolVersion": 1,
+    "maximumProtocolVersion": 1
+  }
+}

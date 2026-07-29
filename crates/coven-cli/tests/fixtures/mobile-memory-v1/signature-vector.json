@@ -1,0 +1,12 @@
+{
+  "fixtureNotice": "SYNTHETIC TEST KEY — NOT A CREDENTIAL",
+  "method": "GET",
+  "pathAndQuery": "/api/v1/mobile/memory/overview",
+  "timestamp": 1785326400,
+  "nonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "bodyDigest": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+  "canonical": "COVEN-MEMORY/1\nGET\n/api/v1/mobile/memory/overview\n1785326400\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+  "privateScalar": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+  "publicKeyX963": "BG_wO5SSQc4drdQ1GeaWDgqFtBppoFwygQOqK84VlMoWPE91OlW_AdxT9sCwx-7ni0DG_30lqW4igrmJzvccFEo",
+  "signatureDER": "MEYCIQDe-8HxHBTSi-K7uBXeL7umSew931dlAJTW9-SJpyUwFAIhAILxGxPVcZH3iUoGMn_0sOaxQsPZwzV_OzYNGrWPgpZ0"
+}

@@ -1,0 +1,33 @@
+{
+  "ok": true,
+  "protocolVersion": 1,
+  "requestId": "01J00000000000000000000003",
+  "data": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "familiarId": "sage",
+    "title": "Synthetic architecture note",
+    "updatedAt": "2026-07-29T12:00:00Z",
+    "source": {
+      "kind": "coven-origin",
+      "label": "Coven origin"
+    },
+    "content": "# Synthetic architecture note\n\nSynthetic content only.",
+    "contentFormat": "markdown",
+    "privacy": {
+      "classification": "public",
+      "revealRequired": false,
+      "reason": "Synthetic fixture is public."
+    },
+    "verification": {
+      "state": "verified",
+      "reason": "Synthetic fixture verification passed."
+    },
+    "attestationMetadata": {
+      "fieldCount": 2
+    },
+    "supersession": {
+      "supersedes": null,
+      "supersededBy": "00000000-0000-0000-0000-000000000002"
+    }
+  }
+}

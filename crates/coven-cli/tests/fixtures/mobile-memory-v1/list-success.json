@@ -1,0 +1,45 @@
+{
+  "ok": true,
+  "protocolVersion": 1,
+  "requestId": "01J00000000000000000000002",
+  "data": [
+    {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "familiarId": "sage",
+      "title": "Synthetic architecture note",
+      "updatedAt": "2026-07-29T12:00:00Z",
+      "relativeUpdatedAt": "2 hours ago",
+      "excerpt": "Synthetic public excerpt.",
+      "source": {
+        "kind": "coven-origin",
+        "label": "Coven origin"
+      },
+      "privacy": {
+        "classification": "public",
+        "revealRequired": false
+      },
+      "verification": {
+        "state": "verified"
+      }
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000002",
+      "familiarId": "echo",
+      "title": "Synthetic protected note",
+      "updatedAt": "2026-07-29T11:00:00Z",
+      "relativeUpdatedAt": "3 hours ago",
+      "excerpt": "Synthetic protected excerpt.",
+      "source": {
+        "kind": "coven-origin",
+        "label": "Coven origin"
+      },
+      "privacy": {
+        "classification": null,
+        "revealRequired": true
+      },
+      "verification": {
+        "state": "needs-review"
+      }
+    }
+  ]
+}

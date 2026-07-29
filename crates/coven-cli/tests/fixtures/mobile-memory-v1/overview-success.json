@@ -1,0 +1,30 @@
+{
+  "ok": true,
+  "protocolVersion": 1,
+  "requestId": "01J00000000000000000000001",
+  "data": {
+    "generatedAt": "2026-07-29T14:00:00Z",
+    "totals": {
+      "entries": 2,
+      "familiars": 2,
+      "verified": 1,
+      "needsReview": 1,
+      "unknown": 0
+    },
+    "lastUpdatedAt": "2026-07-29T12:00:00Z",
+    "capabilities": {
+      "detail": true,
+      "verification": true,
+      "attestationMetadata": true,
+      "supersessionHistory": true,
+      "mutations": false
+    },
+    "verification": {
+      "state": "verified",
+      "checkedAt": "2026-07-29T14:00:00Z",
+      "manifest": "current",
+      "index": "current",
+      "issues": []
+    }
+  }
+}

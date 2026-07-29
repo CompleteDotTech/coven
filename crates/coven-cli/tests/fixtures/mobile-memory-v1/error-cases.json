@@ -1,0 +1,182 @@
+[
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "invalid_request",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "pairing_expired",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "pairing_consumed",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "pairing_confirmation_required",
+      "retryable": true
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "pairing_phrase_mismatch",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "device_unknown",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "device_revoked",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "signature_invalid",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "request_expired",
+      "retryable": true
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "request_replayed",
+      "retryable": true
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "rate_limited",
+      "retryable": true
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "protocol_unsupported",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "capability_unavailable",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "memory_not_found",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "memory_content_too_large",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "memory_content_invalid",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "memory_content_unavailable",
+      "retryable": true
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "daemon_unavailable",
+      "retryable": true
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "response_invalid",
+      "retryable": false
+    }
+  },
+  {
+    "ok": false,
+    "protocolVersion": 1,
+    "requestId": "01J00000000000000000000000",
+    "error": {
+      "code": "gateway_disabled",
+      "retryable": false
+    }
+  }
+]
