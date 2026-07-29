@@ -1,4 +1,6 @@
+pub mod config;
 pub mod contract;
+pub mod identity;
 
 pub const MOBILE_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_MOBILE_REQUEST_BYTES: usize = 64 * 1024;
