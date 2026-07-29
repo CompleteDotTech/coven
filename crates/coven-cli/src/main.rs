@@ -27,6 +27,7 @@ mod familiar_identity;
 mod harness;
 mod hub;
 mod memory_dashboard;
+pub mod mobile_memory;
 mod observe;
 mod openclaw_repo;
 mod parallel_protocol;
