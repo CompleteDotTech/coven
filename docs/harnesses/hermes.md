@@ -53,9 +53,10 @@ coven run hermes "what is in this project?"
 | Stream / continuity | none — every turn is an independent process |
 
 The native `--query` binding replaces the historical `hermes-coven` POSIX
-shim and works consistently on every platform. Coven still recognizes the
-exact legacy trusted manifest and executes the current 1.0.3 recipe in memory;
-modified legacy bytes are not trusted.
+shim and works consistently on every platform. Coven still recognizes exact
+historical trusted manifests—including the Cave-rendered 1.0.2 POSIX and
+Windows documents—and executes the current 1.0.3 recipe in memory. Modified
+legacy bytes are not trusted.
 
 ## Promotion checklist
 

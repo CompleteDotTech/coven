@@ -1079,7 +1079,11 @@ fn legacy_adapter_manifests(adapter_id: &str) -> &'static [&'static str] {
     // memory. Apply that same migration rule to every updated trusted recipe.
     match adapter_id {
         "grok" => &[LEGACY_GROK_BUILD_ADAPTER_MANIFEST],
-        "hermes" => &[LEGACY_HERMES_ADAPTER_MANIFEST],
+        "hermes" => &[
+            LEGACY_HERMES_ADAPTER_MANIFEST,
+            CAVE_HERMES_POSIX_1_0_2_MANIFEST,
+            CAVE_HERMES_WINDOWS_1_0_2_MANIFEST,
+        ],
         "opencode" => &[LEGACY_OPENCODE_ADAPTER_MANIFEST],
         _ => &[],
     }
@@ -1262,6 +1266,74 @@ const LEGACY_HERMES_ADAPTER_MANIFEST: &str = r#"{
       "install_hint": "Install Hermes Agent, add it to PATH, install the hermes-coven shim, and complete Hermes setup before using this adapter.",
       "system_prompt_flag": null,
       "model_flag": "--model"
+    }
+  ]
+}
+"#;
+
+// Cave PR #3704 rendered Hermes 1.0.2 differently on POSIX and Windows.
+// Trust only those exact historical documents, then execute the current recipe.
+const CAVE_HERMES_POSIX_1_0_2_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "hermes",
+      "label": "Hermes Agent",
+      "executable": "hermes-coven",
+      "interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven"
+      ],
+      "non_interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven",
+        "-Q"
+      ],
+      "install_hint": "Install Hermes Agent, add it to PATH, install the hermes-coven shim, and complete Hermes setup before using this adapter.",
+      "model_flag": "--model",
+      "capabilities": {
+        "stream": false,
+        "preassigned_session_id": false,
+        "think": false,
+        "speed": false
+      },
+      "version": "1.0.2",
+      "description": "Hermes adapter with native model forwarding. Uses the hermes-coven shim so the harness trailing positional prompt is remapped to hermes chat -q/--query without changing model arguments."
+    }
+  ]
+}
+"#;
+
+const CAVE_HERMES_WINDOWS_1_0_2_MANIFEST: &str = r#"{
+  "adapters": [
+    {
+      "id": "hermes",
+      "label": "Hermes Agent",
+      "executable": "hermes",
+      "interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven"
+      ],
+      "non_interactive_prompt_prefix_args": [
+        "chat",
+        "--source",
+        "coven",
+        "-Q"
+      ],
+      "install_hint": "Install Hermes Agent, add it to PATH, and complete Hermes setup before using this adapter.",
+      "model_flag": "--model",
+      "capabilities": {
+        "stream": false,
+        "preassigned_session_id": false,
+        "think": false,
+        "speed": false
+      },
+      "version": "1.0.2",
+      "description": "Hermes adapter with native model forwarding and prompt-flag routing for Windows.",
+      "prompt_flag": "-q",
+      "interactive_prompt_flag": "-q"
     }
   ]
 }
@@ -2698,6 +2770,30 @@ mod tests {
     }
 
     #[test]
+    fn cave_hermes_1_0_2_recipe_bytes_match_pr_465() {
+        use sha2::{Digest, Sha256};
+
+        for (platform, manifest, expected_sha256) in [
+            (
+                "posix",
+                CAVE_HERMES_POSIX_1_0_2_MANIFEST,
+                "d0ecc06979bb868e6ebf742a8babafbc2f39a759d369876096f919c4060ed7f1",
+            ),
+            (
+                "windows",
+                CAVE_HERMES_WINDOWS_1_0_2_MANIFEST,
+                "1c0e97645a7fdb08e8d0c5ebc7994efa2de784f6ef818a55264cffe9e5723534",
+            ),
+        ] {
+            let actual_sha256 = Sha256::digest(manifest.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(actual_sha256, expected_sha256, "{platform}");
+        }
+    }
+
+    #[test]
     fn trusted_recipe_size_candidates_cover_current_and_legacy_manifests() {
         for id in ["grok", "hermes", "opencode"] {
             let current = known_adapter_manifest(id).expect("current recipe");
@@ -2775,6 +2871,50 @@ mod tests {
             if matches!(id, "hermes" | "opencode") {
                 assert_eq!(spec.model_id_transform, ModelIdTransform::Preserve);
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cave_hermes_1_0_2_recipes_load_current_recipe_in_memory() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let coven_home = temp_dir.path().join("coven-home");
+        fs::create_dir_all(trusted_adapter_dir(&coven_home))?;
+        let path = trusted_adapter_manifest_path(&coven_home, "hermes");
+
+        for (platform, legacy) in [
+            ("posix", CAVE_HERMES_POSIX_1_0_2_MANIFEST),
+            ("windows", CAVE_HERMES_WINDOWS_1_0_2_MANIFEST),
+        ] {
+            fs::write(&path, legacy)?;
+            assert!(
+                trusted_adapter_manifest_matches_recipe(&path, "hermes"),
+                "{platform} Cave 1.0.2 recipe"
+            );
+
+            let mut sources = trusted_adapter_manifest_sources(&coven_home);
+            assert_eq!(sources.len(), 1, "{platform}");
+            let specs = sources.remove(0).load_specs(&built_in_harness_specs())?;
+            let hermes = specs
+                .iter()
+                .find(|spec| spec.id == "hermes")
+                .expect("current Hermes recipe");
+            assert_eq!(hermes.executable, "hermes", "{platform}");
+            assert_eq!(hermes.prompt_flag.as_deref(), Some("--query"), "{platform}");
+            assert_eq!(
+                hermes.model_id_transform,
+                ModelIdTransform::Preserve,
+                "{platform}"
+            );
+
+            let mut modified = legacy.to_string();
+            modified.replace_range(0..1, "[");
+            assert_eq!(modified.len(), legacy.len(), "{platform}");
+            fs::write(&path, modified)?;
+            assert!(
+                !trusted_adapter_manifest_matches_recipe(&path, "hermes"),
+                "{platform} same-length mutation"
+            );
         }
         Ok(())
     }
