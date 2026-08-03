@@ -165,7 +165,7 @@ Create `rust-toolchain.toml`:
 ```toml
 [toolchain]
 channel = "1.85.0"
-components = ["rustfmt", "clippy"]
+components = ["rustfmt", "clippy", "rust-src"]  # rust-src: rust-analyzer stdlib support
 profile = "minimal"
 ```
 
@@ -175,27 +175,33 @@ Create `Cargo.toml`:
 
 ```toml
 [workspace]
-resolver = "2"
-members = [
-    "crates/psyche-core",
-    "crates/psyche-config",
-    "crates/psyche-runtime",
-    "crates/psyche-cli",
-]
+# Resolver 3 is MSRV-aware. clap, assert_cmd, and toml all declare rust-version
+# 1.85 — exactly our pin — so under resolver 2 a routine `cargo update` would
+# select a release requiring a newer compiler and break the build.
+resolver = "3"
+# Members are added by the task that creates each crate. Cargo loads every
+# declared member's manifest on ANY command — `--no-deps` and `--manifest-path`
+# both still walk up to the workspace root — so naming a crate before it exists
+# makes the entire workspace uninvokable, including `cargo test`.
+members = []
 
 [workspace.package]
 version = "0.0.0"
-edition = "2021"
+# Edition 2024 stabilised in Rust 1.85 — the version pinned above. Adopting it
+# now costs nothing; deferring means migrating four crates of real code later,
+# and the 2024 `if let` temporary-scope change alters when guards drop across
+# awaits, which is a behavioural migration best done at 50 lines.
+edition = "2024"
 rust-version = "1.85"
+publish = false   # distributed via npm, never crates.io
 license = "MIT"
 repository = "https://github.com/OpenCoven/psyche"
 
 [workspace.dependencies]
-psyche-core = { path = "crates/psyche-core" }
-psyche-config = { path = "crates/psyche-config" }
-psyche-runtime = { path = "crates/psyche-runtime" }
+# Path entries are added by the task that creates each crate, for the same
+# reason `members` is: naming a path that does not exist is a latent break.
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time"] }
@@ -206,30 +212,87 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
+# Shared lint policy. Declared at bootstrap because retrofitting it later means
+# editing every member manifest *and* clearing whatever backlog the new lints
+# surface across real code; each crate is instead born compliant.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# The highest-value pair for a long-running daemon. clippy.toml permits them in
+# tests. Deliberately NOT clippy::pedantic — noisy enough to train people to
+# reach for #[allow], and module_name_repetitions fires on schema::SchemaError.
+unwrap_used = "deny"
+expect_used = "deny"
+
 [profile.release]
 codegen-units = 1
 lto = true
 opt-level = "s"
-strip = true
+# "debuginfo", not true: `strip = true` also removes the symbol table, which
+# turns field panics in an npm-distributed daemon into unresolved hex addresses.
+strip = "debuginfo"
 ```
 
-- [ ] **Step 3: Ignore build and local state**
+- [ ] **Step 3: Permit unwrap/expect in tests**
+
+Create `clippy.toml`:
+
+```toml
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+```
+
+Without this, `clippy::unwrap_used` fires on `unwrap_err()` in every test.
+
+- [ ] **Step 4: Ignore build and local state**
 
 Create `.gitignore`:
 
 ```gitignore
 /target
 **/node_modules
-*.log
+/*.log
 .DS_Store
+.env*
+*.tgz
 ```
 
-- [ ] **Step 4: Verify the workspace resolves**
+`.env*` matters most here: this repo will eventually hold npm publish tokens and
+signing material. `*.log` is anchored to the root so it cannot silently swallow a
+committed log-output test fixture, which is a realistic collision for a project
+built around structured logging.
 
-Run: `cargo metadata --format-version 1 --no-deps > /dev/null && echo OK`
-Expected: `OK`. (Members do not exist yet, so `cargo build` still fails — that is expected until Task 2.)
+- [ ] **Step 5: Verify the empty workspace and toolchain parse**
 
-- [ ] **Step 5: Commit**
+Run:
+
+```bash
+cargo metadata --format-version 1 --no-deps > /dev/null && echo OK
+```
+
+Expected: `OK`.
+
+`cargo build` and `cargo test` cannot succeed yet, by design: this is a virtual
+manifest whose workspace has no members. Expect:
+
+```
+error: manifest path `.../psyche` contains no package: The manifest is virtual,
+and the workspace has no members.
+```
+
+That build/test error is the correct state at the end of Task 1. **Do not create
+crate stubs to silence it** — Task 2 owns those files, and stubbing here breaks
+the task boundary. The first real build/test verification runs at the end of
+Task 2.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml rust-toolchain.toml .gitignore
@@ -255,11 +318,19 @@ Create `crates/psyche-core/src/schema.rs`:
 /// The only configuration schema this build accepts.
 pub const CONFIG_SCHEMA_VERSION: &str = "psyche.config.v1";
 
+/// Reasons a declared schema version is not usable by this build.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SchemaError {
-    #[error("unsupported schema_version `{found}`; this build accepts `{expected}`")]
+    // {found:?} not {found}: a hand-edited `schema_version = " psyche.config.v1"`
+    // would otherwise log as visually identical to the accepted value, and the
+    // value is untrusted text going into a log line — newlines and ANSI escapes
+    // are log injection. `expected` is not a field: it is always this const, and
+    // a public field would let callers construct a state that cannot exist.
+    /// The configuration declared a version this build does not accept. Denial
+    /// is unconditional: there is no compatibility range and no coercion.
+    #[error("unsupported schema_version {found:?}; this build accepts {CONFIG_SCHEMA_VERSION:?}")]
     UnsupportedVersion {
-        expected: &'static str,
+        /// The rejected value, byte-for-byte as it appeared in the configuration.
         found: String,
     },
 }
@@ -268,27 +339,58 @@ pub enum SchemaError {
 mod tests {
     use super::*;
 
+    // The literal, not the const: this string is the on-disk contract with every
+    // user's config file, so a typo in the const must fail a test rather than
+    // silently redefine the format.
     #[test]
-    fn accepts_the_current_version() {
-        assert!(ensure_schema_version(CONFIG_SCHEMA_VERSION).is_ok());
+    fn the_accepted_version_string_is_stable() {
+        assert_eq!(CONFIG_SCHEMA_VERSION, "psyche.config.v1");
+        assert!(ensure_schema_version("psyche.config.v1").is_ok());
     }
 
     #[test]
     fn denies_a_future_version() {
         let err = ensure_schema_version("psyche.config.v2").unwrap_err();
-        assert_eq!(
-            err,
-            SchemaError::UnsupportedVersion {
-                expected: "psyche.config.v1",
-                found: "psyche.config.v2".to_string(),
-            }
-        );
+        // matches!, not a full struct literal: pins what an operator can observe
+        // without coupling the test to the variant's field list.
+        assert!(matches!(err, SchemaError::UnsupportedVersion { ref found } if found == "psyche.config.v2"));
     }
 
     #[test]
-    fn denies_an_empty_version() {
-        assert!(ensure_schema_version("").is_err());
+    fn the_error_names_both_versions() {
+        // The #[error] format string is the operator-facing contract; without
+        // this it could be mangled to anything and every other test would pass.
+        let rendered = ensure_schema_version("psyche.config.v2").unwrap_err().to_string();
+        assert!(rendered.contains("psyche.config.v2"), "{rendered}");
+        assert!(rendered.contains("psyche.config.v1"), "{rendered}");
     }
+
+    // These pin the deliberate strictness. Without them, someone "helpfully"
+    // adding .trim() or eq_ignore_ascii_case would break G2 denial silently.
+    #[test]
+    fn denies_near_misses() {
+        for near in [
+            "",
+            " psyche.config.v1",
+            "psyche.config.v1 ",
+            "psyche.config.v1\n",
+            "PSYCHE.CONFIG.V1",
+            "psyche.config.v10",
+            "psyche.config.v1.1",
+        ] {
+            assert!(
+                ensure_schema_version(near).is_err(),
+                "expected denial for {near:?}"
+            );
+        }
+    }
+
+    // psyche-runtime is tokio-based, so this error crosses task boundaries and
+    // lands in Box<dyn Error + Send + Sync>. Fails at compile time if that breaks.
+    const _: fn() = || {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<SchemaError>();
+    };
 }
 ```
 
@@ -306,26 +408,27 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-serde = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true
 ```
+
+The `[lints] workspace = true` stanza is required in **every** member manifest —
+workspace lints are opt-in per package, so a crate that omits it silently escapes
+the policy. Tasks 4, 5, and 6 repeat it.
 
 Create `crates/psyche-core/src/lib.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 //! Core versioned identifiers and secret-reference types for Psyche.
 
+// One public path per item. Flat re-exports alongside public modules would give
+// every type two spellings for downstream crates to drift between, and a glob
+// re-export would silently promote anything later added to `secret.rs` into the
+// public API. Callers write `psyche_core::schema::ensure_schema_version`.
 pub mod schema;
 pub mod secret;
-
-pub use schema::{ensure_schema_version, SchemaError, CONFIG_SCHEMA_VERSION};
-// Glob re-export deliberately. A braced re-export from this module matches
-// coven's secret-guard generic-assignment rule, because Rust path syntax
-// supplies the separator the rule looks for and the brace list supplies the
-// trailing run of characters. The glob form exports the same items without
-// tripping it.
-pub use secret::*;
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -340,13 +443,12 @@ Append to `crates/psyche-core/src/schema.rs`, above the `#[cfg(test)]` block:
 ```rust
 /// Returns `Ok` only for the exact supported version. No range matching, no
 /// coercion — an unknown version is a denial, which is what G2 requires.
-pub fn ensure_schema_version(found: &str) -> Result<(), SchemaError> {
-    if found == CONFIG_SCHEMA_VERSION {
+pub fn ensure_schema_version(declared: &str) -> Result<(), SchemaError> {
+    if declared == CONFIG_SCHEMA_VERSION {
         Ok(())
     } else {
         Err(SchemaError::UnsupportedVersion {
-            expected: CONFIG_SCHEMA_VERSION,
-            found: found.to_string(),
+            found: declared.to_string(),
         })
     }
 }
@@ -361,9 +463,31 @@ Create a placeholder `crates/psyche-core/src/secret.rs` so the crate compiles; T
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p psyche-core schema`
-Expected: `test result: ok. 3 passed; 0 failed`.
+Expected: `test result: ok. 4 passed; 0 failed`.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Register the crate as a workspace member**
+
+Only now that `crates/psyche-core/Cargo.toml` exists can it be declared. In the
+root `Cargo.toml`, replace `members = []` and add the matching path dependency:
+
+```toml
+members = ["crates/psyche-core"]
+
+[workspace.dependencies]
+psyche-core = { path = "crates/psyche-core" }
+# ...the registry dependencies declared in Task 1 remain below...
+```
+
+Then verify the workspace loads:
+
+```bash
+cargo metadata --format-version 1 --no-deps > /dev/null && echo OK
+```
+
+Expected: `OK`. Each later task appends its own crate the same way, so the list
+always names exactly the crates that exist and cargo stays usable throughout.
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/psyche-core
@@ -395,15 +519,87 @@ Replace `crates/psyche-core/src/secret.rs` with:
 
 use std::fmt;
 
+/// A pointer to a secret held by an external store — never the secret itself.
+///
+/// Deserialising goes through [`TryFrom<String>`], which accepts only an
+/// allowlisted secret-store scheme — so neither a bare credential nor a URL
+/// with one embedded in it can enter. Both `Debug` and `Display` redact, so a
+/// reference cannot leave through a log line or a panic message either.
+///
+/// `Serialize` is deliberately not implemented. A type that redacts in logs but
+/// prints plaintext in a config dump is a trap. If a dump ever needs it (e.g. a
+/// `config show` command), it must be a hand-written impl rather than a derive,
+/// so the choice is visible at the site that makes it.
 #[derive(Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct SecretRef(String);
 
+/// Reasons a value is not usable as a secret reference.
+///
+/// Every variant is deliberately payload-free. The rejection path is exactly
+/// where a real secret is most likely to be present, so the rejected value is
+/// dropped rather than echoed into an error message or a log line.
+///
+/// **That guarantee ends at this type.** A deserializer may wrap it in an error
+/// that is not payload-free: `toml::de::Error` — the one the configuration
+/// contract actually uses — echoes the offending source line through `Display`,
+/// and its `Debug` carries the entire input file. Logging one with
+/// `tracing::error!(?err)` after a failed config load would emit every secret in
+/// that file, not just the rejected value. A config loader must render its own
+/// message and must never log a `toml::de::Error` from a file that can contain
+/// `secret_ref`.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SecretRefError {
-    #[error("secret_ref must be a reference URI such as `op://VAULT/ITEM/field`, not a literal value")]
-    NotAReference,
+    /// The value did not begin with a supported secret-store scheme.
+    ///
+    /// This rejects ordinary URLs on purpose. A general "contains `://`" check
+    /// would accept `https://host/bot<token>/send` or
+    /// `https://user:pass@host/path`, both of which carry the secret *inside*
+    /// the URI — the likelier paste, since it is the form API docs show.
+    #[error(
+        "secret_ref must name a supported secret store (case-sensitive), e.g. `op://VAULT/ITEM/field`"
+    )]
+    UnsupportedScheme,
+    /// A supported scheme with nothing after it, such as a bare `op://`.
+    ///
+    /// Accepting it would defer the failure to resolution time, far from the
+    /// configuration file that caused it.
+    #[error("secret_ref has a scheme but no path, e.g. `op://` with no vault/item/field")]
+    EmptyPath,
+    /// The path is present but not a usable reference: too few segments, an empty
+    /// segment, surrounding whitespace, or a control or format character.
+    ///
+    /// Whitespace is rejected rather than trimmed. Storing something other than
+    /// what the operator wrote is worse than telling them, and control
+    /// characters would otherwise reach a resolver's log line as injection —
+    /// the same argument `schema` makes for `{found:?}`.
+    #[error(
+        "secret_ref path must be VAULT/ITEM/FIELD with no empty segments, surrounding whitespace, or control or format characters"
+    )]
+    MalformedPath,
+    /// The reference exceeds the maximum accepted length.
+    #[error("secret_ref is too long")]
+    TooLong,
 }
+
+/// Schemes naming a supported external secret store.
+///
+/// `op://` is the only store the configuration contract defines today. Adding
+/// one is a line here plus a test — deliberately an allowlist rather than a
+/// general URI check, so a value can only ever *point at* a secret.
+const SUPPORTED_SCHEMES: [&str; 1] = ["op://"];
+
+/// Minimum `/`-separated segments after the scheme: vault, item, field.
+///
+/// Path grammar is per-store, so a second scheme means more than another entry
+/// in [`SUPPORTED_SCHEMES`] — it needs per-scheme dispatch, e.g.
+/// `[(&str, fn(&str) -> bool); N]`. Recorded here so that is a deliberate
+/// decision rather than one made under pressure when the second store lands.
+const REQUIRED_SEGMENTS: usize = 3;
+
+/// Longest reference accepted. A vault path is short; anything near this is a
+/// paste accident. Bounds the blast radius of any future redaction bug.
+const MAX_REFERENCE_LEN: usize = 2048;
 
 #[cfg(test)]
 mod tests {
@@ -422,8 +618,163 @@ mod tests {
         // reviewers to wave through that shape.
         let token_shaped = format!("{}:{}", "1234567890", "A".repeat(35));
         let err = SecretRef::try_from(token_shaped).unwrap_err();
-        assert_eq!(err, SecretRefError::NotAReference);
+        assert_eq!(err, SecretRefError::UnsupportedScheme);
     }
+
+    // The cases a "contains ://" check would have accepted. These are the point
+    // of the allowlist: a secret carried *inside* a URI is the likelier paste.
+    #[test]
+    fn rejects_a_url_with_the_secret_in_its_path() {
+        let url = format!("https://api.example.com/bot{}/send", "A".repeat(35));
+        assert_eq!(
+            SecretRef::try_from(url).unwrap_err(),
+            SecretRefError::UnsupportedScheme
+        );
+    }
+
+    #[test]
+    fn rejects_a_url_carrying_inline_credentials() {
+        let url = format!("https://user:{}@example.com/path", "A".repeat(20));
+        assert_eq!(
+            SecretRef::try_from(url).unwrap_err(),
+            SecretRefError::UnsupportedScheme
+        );
+    }
+
+    #[test]
+    fn rejects_an_unallowlisted_scheme() {
+        for other in ["file:///etc/shadow", "http://example.com/x", "x://y"] {
+            assert_eq!(
+                SecretRef::try_from(other.to_string()).unwrap_err(),
+                SecretRefError::UnsupportedScheme,
+                "expected rejection for {other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_a_scheme_with_no_path() {
+        assert_eq!(
+            SecretRef::try_from("op://".to_string()).unwrap_err(),
+            SecretRefError::EmptyPath
+        );
+    }
+
+    #[test]
+    fn error_renderings_never_echo_any_of_the_rejected_value() {
+        // Display AND Debug: Debug is what panics and `tracing` `?err` print, so
+        // a payload field added to a variant would leak there first. Checks every
+        // 8-byte window, not just the whole string, so a truncated echo fails too.
+        let secretish = format!("{}:{}", "1234567890", "A".repeat(35));
+        let long = format!("op://{}", "B".repeat(4096));
+        // Deliberately NOT `op://VAULT/ITEM`: `MalformedPath`'s message states
+        // the grammar as the literal text `VAULT/ITEM/FIELD`, so that input
+        // collides with a static example rather than proving an echo. The
+        // assertion below is unchanged in strength — only the sample differs.
+        //
+        // Every sample must be >= 8 bytes: windows(8) yields no iterations for
+        // shorter input, so a short sample would pass vacuously. "op://" (the
+        // EmptyPath case, 5 bytes) is deliberately not in this list.
+        for input in [
+            secretish,
+            long,
+            "op://alpha/beta".to_string(),
+            "op:// x/y/z".to_string(),
+        ] {
+            let err = SecretRef::try_from(input.clone()).unwrap_err();
+            for rendering in [err.to_string(), format!("{err:?}")] {
+                for window in input.as_bytes().windows(8) {
+                    let needle = String::from_utf8_lossy(window);
+                    assert!(
+                        !rendering.contains(needle.as_ref()),
+                        "error echoed {needle:?} from input: {rendering}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Mirrors schema.rs's denies_near_misses. Without it, someone "helpfully"
+    // adding .trim() or a case-insensitive scheme match breaks these silently.
+    #[test]
+    fn rejects_near_misses() {
+        for (input, expected) in [
+            ("OP://VAULT/ITEM/field", SecretRefError::UnsupportedScheme),
+            (" op://VAULT/ITEM/field", SecretRefError::UnsupportedScheme),
+            ("op://VAULT/ITEM", SecretRefError::MalformedPath),
+            ("op://VAULT", SecretRefError::MalformedPath),
+            ("op:///", SecretRefError::MalformedPath),
+            ("op://VAULT//field", SecretRefError::MalformedPath),
+            ("op:// VAULT/ITEM/field", SecretRefError::MalformedPath),
+            ("op://VAULT/ITEM/field ", SecretRefError::MalformedPath),
+            ("op://VAULT/ITEM/field\n", SecretRefError::MalformedPath),
+            (
+                "op://VAULT\u{1b}[31m/ITEM/field",
+                SecretRefError::MalformedPath,
+            ),
+            (
+                "op://VAULT/ITEM/fi\u{202e}eld",
+                SecretRefError::MalformedPath,
+            ),
+            (
+                "op://VA\u{200b}ULT/ITEM/field",
+                SecretRefError::MalformedPath,
+            ),
+        ] {
+            assert_eq!(
+                SecretRef::try_from(input.to_string()).unwrap_err(),
+                expected,
+                "wrong error for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_internal_spaces_in_segment_names() {
+        // 1Password vault and item names legitimately contain spaces.
+        assert!(SecretRef::try_from("op://My Vault/My Item/token".to_string()).is_ok());
+    }
+
+    #[test]
+    fn rejects_an_over_long_reference() {
+        let long = format!("op://{}", "B".repeat(4096));
+        assert_eq!(
+            SecretRef::try_from(long).unwrap_err(),
+            SecretRefError::TooLong
+        );
+    }
+
+    // The serde attribute is the load-bearing mechanism and was previously
+    // untested: deleting `#[serde(try_from = "String")]` would make SecretRef
+    // accept any string, and every other test here would still pass.
+    #[test]
+    fn deserialising_goes_through_validation() {
+        // `unwrap_err` on `Result<Holder, _>` needs `Holder: Debug`. Deriving it
+        // is safe precisely because `SecretRef`'s own `Debug` redacts, so the
+        // nested rendering is `Holder { secret_ref: SecretRef(<redacted>) }`.
+        #[derive(Debug, serde::Deserialize)]
+        struct Holder {
+            secret_ref: SecretRef,
+        }
+
+        let ok: Holder = serde_json::from_str(r#"{"secret_ref":"op://V/I/f"}"#).unwrap();
+        assert_eq!(ok.secret_ref.expose_reference(), "op://V/I/f");
+
+        let token_shaped = format!("{}:{}", "1234567890", "A".repeat(35));
+        let json = format!(r#"{{"secret_ref":"{token_shaped}"}}"#);
+        let err = serde_json::from_str::<Holder>(&json).unwrap_err();
+        assert!(
+            !err.to_string().contains(&token_shaped),
+            "serde echoed input: {err}"
+        );
+    }
+
+    // psyche-runtime is tokio-based; these cross task boundaries.
+    const _: fn() = || {
+        fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+        assert_send_sync_static::<SecretRef>();
+        assert_send_sync_static::<SecretRefError>();
+    };
 
     #[test]
     fn debug_never_reveals_the_reference() {
@@ -453,17 +804,53 @@ Expected: FAIL — `the trait bound SecretRef: From<String> is not satisfied` an
 Insert into `crates/psyche-core/src/secret.rs`, above the `#[cfg(test)]` block:
 
 ```rust
+/// Characters rejected inside a reference path.
+///
+/// `char::is_control` covers Unicode `Cc` only. The `Cf` format characters below
+/// enable visual spoofing — a right-to-left override can make a path render as
+/// something other than what it resolves to — so they are rejected explicitly
+/// rather than pulling in a Unicode-category dependency for the general case.
+fn is_forbidden_in_path(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200b}'..='\u{200f}'   // zero-width and directional marks
+            | '\u{202a}'..='\u{202e}' // bidi embedding and overrides
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+        )
+}
+
 impl TryFrom<String> for SecretRef {
     type Error = SecretRefError;
 
     fn try_from(raw: String) -> Result<Self, Self::Error> {
-        // A reference must name an external store. This is what stops a raw
-        // Telegram token being pasted into `secret_ref`.
-        if raw.contains("://") && !raw.starts_with("://") {
-            Ok(SecretRef(raw))
-        } else {
-            Err(SecretRefError::NotAReference)
+        let Some(scheme) = SUPPORTED_SCHEMES.iter().find(|s| raw.starts_with(**s)) else {
+            return Err(SecretRefError::UnsupportedScheme);
+        };
+        if raw.len() > MAX_REFERENCE_LEN {
+            return Err(SecretRefError::TooLong);
         }
+        // `starts_with` guarantees scheme.len() is a char boundary, so this
+        // slice cannot panic — worth stating in a crate that denies `unwrap`.
+        let path = &raw[scheme.len()..];
+        if path.is_empty() {
+            return Err(SecretRefError::EmptyPath);
+        }
+        // Surrounding whitespace only: vault and item names may legitimately
+        // contain internal spaces.
+        if path.trim() != path || path.chars().any(is_forbidden_in_path) {
+            return Err(SecretRefError::MalformedPath);
+        }
+        let mut segments = 0usize;
+        for segment in path.split('/') {
+            if segment.is_empty() {
+                return Err(SecretRefError::MalformedPath);
+            }
+            segments += 1;
+        }
+        if segments < REQUIRED_SEGMENTS {
+            return Err(SecretRefError::MalformedPath);
+        }
+        Ok(SecretRef(raw))
     }
 }
 
@@ -509,26 +896,65 @@ git commit -m "feat(core): add non-printing SecretRef that rejects literal value
 - Create: `crates/psyche-config/src/lib.rs`
 - Create: `docs/CONFIGURATION.md`
 
+**Before you start — a requirement discovered during Task 3.**
+
+`toml::de::Error` is not payload-free. Its `Display` echoes the offending source
+line verbatim, and its `Debug` carries `input: Some(<the entire file>)`. A single
+`tracing::error!(?err)` on a failed config load would therefore emit every secret
+in the file, not just the value that failed — defeating `SecretRefError`'s
+payload-free design one layer up.
+
+So this loader must never let a `toml::de::Error` escape — not through `Debug`,
+and not through `Display` either, which is the subtler half: an
+`#[error("...: {0}")]` that interpolates the TOML error renders the offending
+source line straight into the message.
+
+`ConfigError` therefore does **not** hold one and has no `#[from]` for it. The
+deserializer error is reduced to a fixed, payload-free variant at exactly one
+place, `reduce_toml_error`. Do not retain even `toml::de::Error::message()`:
+serde diagnostics may embed the rejected scalar. Task 3 made its rule greppable
+through a single `expose_reference` accessor; this is the same move, so review
+can grep one name instead of auditing every `?`.
+
+- [ ] **Step 0: Register the crate**
+
+Create `crates/psyche-config/` and add it to the workspace as the task that
+creates it, per the rule established in Task 2 — cargo loads every declared
+member on any command, so a member named before it exists breaks the workspace.
+
+In the root `Cargo.toml`, extend `members` to
+`["crates/psyche-core", "crates/psyche-config"]`, and add
+`psyche-config = { path = "crates/psyche-config" }` to `[workspace.dependencies]`
+beneath the `psyche-core` entry.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `crates/psyche-config/src/lib.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 //! Strict `psyche.config.v1` loading. Unknown fields are errors; unknown
 //! versions are denied before field validation so the error names the real
 //! cause.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-use psyche_core::{ensure_schema_version, SchemaError};
+use psyche_core::schema::{ensure_schema_version, SchemaError};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// A parsed `psyche.config.v1` document.
+///
+/// No `Eq`: `extensions` is a `toml::Table` whose values include `Float(f64)`,
+/// so `toml::Value` derives only `PartialEq`. No derived `Debug` either — see
+/// the manual impl below.
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Must be `psyche.config.v1`; any other value is denied.
     pub schema_version: String,
+    /// Directory owning local Psyche state.
     pub data_dir: PathBuf,
+    /// Coven daemon connection settings.
     pub coven: CovenConfig,
     /// The only place unknown keys are tolerated, and only under an explicitly
     /// versioned table.
@@ -536,25 +962,70 @@ pub struct Config {
     pub extensions: toml::Table,
 }
 
+/// Coven daemon connection settings.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CovenConfig {
+    /// Path to the Coven daemon socket.
     pub socket: PathBuf,
+    /// Named daemon contract required before any dependent action.
     pub required_api_version: String,
 }
 
+/// Errors from loading configuration.
+///
+/// `Parse` deliberately does **not** hold a [`toml::de::Error`], and there is no
+/// `#[from]` for one. That type's `Display` renders the offending source line
+/// verbatim and its `Debug` carries `input: Some(<the entire file>)`, so holding
+/// one would leave every secret in the file a single `?err` away from a log. The
+/// deserializer error is reduced to a payload-free form at exactly one place —
+/// [`reduce_toml_error`] — which is what review should grep for.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    #[error("configuration is not valid TOML: {0}")]
-    Parse(#[from] toml::de::Error),
+    /// The file is not valid TOML, or violates the strict schema.
+    #[error("configuration is not valid TOML or violates the strict schema")]
+    Parse,
+    /// The declared `schema_version` is not accepted by this build.
     #[error(transparent)]
     Schema(#[from] SchemaError),
+    /// The configuration file could not be read.
     #[error("cannot read configuration at {path}: {source}")]
     Read {
+        /// Path that could not be read.
         path: PathBuf,
+        /// Underlying I/O failure.
         #[source]
         source: std::io::Error,
     },
+}
+
+// Manual `Debug`, not derived. `extensions` holds arbitrary untyped
+// `toml::Value`, so a derived impl would print whatever is in it — including a
+// secret placed there by a future extension — on `tracing::debug!(?config)`
+// after a *successful* load. `reduce_toml_error` guards the failure path; this
+// guards the success path, which is the one more often logged.
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("schema_version", &self.schema_version)
+            .field("data_dir", &self.data_dir)
+            .field("coven", &self.coven)
+            .field(
+                "extensions",
+                &format_args!("<{} key(s) redacted>", self.extensions.len()),
+            )
+            .finish()
+    }
+}
+
+/// The single conversion from a deserializer error into a payload-free one.
+///
+/// Taking ownership and discarding the error is deliberate. Both the complete
+/// error and its message can carry input values. Keeping this in one function
+/// means a review can grep `reduce_toml_error` to find every place a TOML error
+/// crosses the boundary, rather than auditing every `?`.
+fn reduce_toml_error(_: toml::de::Error) -> ConfigError {
+    ConfigError::Parse
 }
 
 #[cfg(test)]
@@ -581,13 +1052,22 @@ required_api_version = "coven.daemon.v1"
 
     #[test]
     fn rejects_an_unknown_top_level_field() {
-        let raw = format!("{VALID}\ntelegram_token = \"nope\"\n");
+        let sentinel = "must-never-appear-in-an-error";
+        let raw = VALID.replacen(
+            "\n[coven]",
+            &format!("\ntelegram_token = \"{sentinel}\"\n\n[coven]"),
+            1,
+        );
         let err = load_str(&raw).unwrap_err();
         assert!(
-            matches!(err, ConfigError::Parse(_)),
+            matches!(err, ConfigError::Parse),
             "expected a parse error, got {err:?}"
         );
-        assert!(err.to_string().contains("telegram_token"));
+        assert_eq!(
+            err.to_string(),
+            "configuration is not valid TOML or violates the strict schema"
+        );
+        assert!(!format!("{err:?}").contains(sentinel));
     }
 
     #[test]
@@ -619,6 +1099,19 @@ required_api_version = "coven.daemon.v1"
     }
 
     #[test]
+    fn debug_does_not_print_extension_values() {
+        let sentinel = "must-never-appear-in-debug";
+        let raw = format!(
+            "{VALID}\n[extensions.\"psyche.experiment.v1\"]\nvalue = \"{sentinel}\"\n"
+        );
+        let cfg = load_str(&raw).unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("value"), "{rendered}");
+        assert!(!rendered.contains(sentinel), "{rendered}");
+        assert!(rendered.contains("1 key(s) redacted"), "{rendered}");
+    }
+
+    #[test]
     fn missing_file_reports_the_path() {
         let err = load_path(Path::new("/nonexistent/psyche.toml")).unwrap_err();
         assert!(err.to_string().contains("/nonexistent/psyche.toml"));
@@ -644,6 +1137,9 @@ psyche-core = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -665,9 +1161,9 @@ struct VersionProbe {
 }
 
 pub fn load_str(raw: &str) -> Result<Config, ConfigError> {
-    let probe: VersionProbe = toml::from_str(raw)?;
+    let probe: VersionProbe = toml::from_str(raw).map_err(reduce_toml_error)?;
     ensure_schema_version(&probe.schema_version)?;
-    let config: Config = toml::from_str(raw)?;
+    let config: Config = toml::from_str(raw).map_err(reduce_toml_error)?;
     Ok(config)
 }
 
@@ -683,7 +1179,7 @@ pub fn load_path(path: &Path) -> Result<Config, ConfigError> {
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test -p psyche-config`
-Expected: `test result: ok. 5 passed; 0 failed`.
+Expected: `test result: ok. 6 passed; 0 failed`.
 
 - [ ] **Step 6: Document the shipped contract**
 
@@ -747,7 +1243,6 @@ git commit -m "feat(config): strict psyche.config.v1 loading with version-first 
 Create `crates/psyche-runtime/src/lib.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 //! Composition root. Owns the daemon lifecycle and the only shutdown path.
 
 use std::sync::{Arc, Mutex};
@@ -847,6 +1342,9 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -1073,6 +1571,9 @@ tracing-subscriber = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -1154,7 +1655,6 @@ pub fn run(config: &Config) -> Vec<Check> {
 Create `crates/psyche-cli/src/main.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 
 mod doctor;
 mod logging;
@@ -1256,7 +1756,6 @@ fn main() -> ExitCode {
 Create `crates/psyche-cli/src/bin/psyched.rs`:
 
 ```rust
-#![forbid(unsafe_code)]
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -1708,6 +2207,13 @@ gh pr create --repo OpenCoven/psyche \
 ```
 
 Expected: a PR URL. Do **not** enable auto-merge.
+
+**Squash-merge this branch.** Review fixes are applied as follow-up commits rather
+than amends (so each reviewed state stays inspectable), which means intermediate
+commits can be individually non-building — for example, the commit that adds the
+first crate still declares four workspace members and does not compile until the
+next commit narrows the list. Squashing collapses that into one buildable commit
+and keeps `main` bisectable. Rebase-merging would preserve the broken states.
 
 - [ ] **Step 3: Stop at the review gate**
 
