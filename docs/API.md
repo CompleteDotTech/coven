@@ -35,6 +35,12 @@ See [Authentication and local access](/AUTH) for the current auth posture. In sh
 
 The current public API contract is the named **`coven.daemon.v1`** contract served under the `/api/v1` route prefix.
 
+Clients negotiate compatibility with `GET /api/v1/health`, then check its
+named `apiVersion` and every capability required by the operation before
+sending a dependent request. Capabilities advertise availability and never grant permission.
+`GET /api/v1/api-version` remains a legacy route-family
+diagnostic whose literal `v1` values are not proof of named-contract support.
+
 The complete endpoint index — contract discovery, sessions and events, observability reads, cast and familiar writes, skills, store, travel, scheduler, and the hub control plane — lives in the [API reference](reference/api.md). This page keeps the architecture, auth posture, and canonical response examples; the reference page is the single source of truth for what routes exist.
 
 Full request/response shapes for the hub control plane (node registry, routing table, global and per-executor queues) live in [`API-CONTRACT.md`](API-CONTRACT.md); hub restart and supervision guidance lives in [`HUB-OPERATIONS.md`](HUB-OPERATIONS.md).
@@ -62,13 +68,14 @@ Event payloads returned by `/events`, `/sessions/:id/events`, and `/sessions/:id
     "travel": true,
     "scheduler": true,
     "hub": true,
+    "executorDispatch": true,
     "eventCursor": "sequence",
     "structuredErrors": true
   },
   "daemon": {
     "pid": 12345,
     "startedAt": "2026-05-09T12:00:00Z",
-    "socket": "/Users/example/.coven/coven.sock"
+    "socket": "<covenHome>/coven.sock"
   },
   "hub": {
     "role": "hub",
@@ -143,6 +150,8 @@ Immediately completed safe actions return `200` with an event-shaped payload tha
 
 - Additive JSON fields are allowed in `v1` responses.
 - Existing required fields should not be removed or renamed inside `v1`.
-- Breaking response-shape or behavior changes require a new API version prefix.
+- Breaking response-shape or behavior changes require a new named `apiVersion`
+  value from `GET /api/v1/health`; they do not inherently require a new route
+  prefix.
 - External clients should call `/api/v1/health` before assuming compatibility.
 - Daemon changes that affect `/api/v1/health`, `/api/v1/sessions`, `/api/v1/events`, `/api/v1/sessions/:id/events`, input, or kill behavior should update client compatibility tests in the same repo.

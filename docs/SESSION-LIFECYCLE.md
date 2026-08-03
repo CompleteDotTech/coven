@@ -1,10 +1,10 @@
 ---
 title: "Session lifecycle"
-summary: "How a Coven session moves through created, running, completed, failed, orphaned, archived, and summoned states from coven run to replay."
+summary: "How a Coven harness session moves through created, running, idle, completed, failed, killed, and orphaned statuses, with archive visibility stored separately."
 read_when:
   - Understanding session states
   - Implementing attach, archive, summon, or sacrifice behavior
-description: "How a Coven session moves through created, running, completed, failed, orphaned, archived, and summoned states from coven run to replay."
+description: "How a Coven harness session moves through its seven ledger statuses while archive visibility remains separate."
 ---
 
 # Session Lifecycle
@@ -13,40 +13,52 @@ This document explains what happens from `coven run` through completion, replay,
 
 ## Lifecycle states
 
-The current store records session status as a string. Common states include:
+The current store records harness-session status as a string.
 
-- `created` - the session record exists before live execution begins.
-- `running` - the harness process is active under daemon supervision.
-- `completed` - the harness exited successfully.
-- `failed` - setup or launch failed before normal completion.
-- `orphaned` - a previous daemon stopped while a session was still marked running.
+| Status | Terminal in the current ledger | Meaning |
+|---|---:|---|
+| `created` | No | Durable row exists; no live runtime has been established. Recovery moves a stale unowned row to `failed`. |
+| `running` | No | A daemon-owned or registered external runtime is live. |
+| `idle` | No | A conversational turn completed and the session remains reusable. |
+| `completed` | Yes | Runtime completion was successful. |
+| `failed` | Yes | Launch or runtime completion failed. |
+| `killed` | Yes | A kill request was accepted and persisted; this is not proof of acknowledged process termination. |
+| `orphaned` | Yes | Recovery cannot prove ownership of a row previously marked running. |
 
-Archive state is stored separately as `archived_at`. A completed or failed session can be hidden from the active list without changing its final status.
+Archive visibility is stored separately in `archived_at` and does not change
+the lifecycle status. Synthetic Cast quest-anchor rows may use `active`; that
+store value is not a harness-session state and must be classified by row kind
+before interpreting status.
 
 ```mermaid
 stateDiagram-v2
   [*] --> created: coven run / POST /sessions
   created --> running: PTY spawn succeeds
-  created --> failed: validation fails / PTY spawn errors
-  running --> completed: harness exits 0
+  created --> failed: launch fails / stale unowned recovery
+  running --> idle: clean conversational exit (conversation_id set)
+  running --> completed: clean one-shot exit
   running --> failed: harness exits non-zero
-  running --> orphaned: daemon stops while running
+  running --> killed: kill request accepted and persisted
+  running --> orphaned: recovery cannot prove daemon ownership
 
-  completed --> archived: coven archive
-  failed --> archived: coven archive
-  orphaned --> archived: coven archive
-
-  archived --> completed: coven summon (was completed)
-  archived --> failed: coven summon (was failed)
-  archived --> orphaned: coven summon (was orphaned)
+  completed --> completed: archive sets / summon clears archived_at
+  failed --> failed: archive sets / summon clears archived_at
+  killed --> killed: archive sets / summon clears archived_at
+  orphaned --> orphaned: archive sets / summon clears archived_at
 
   completed --> [*]: coven sacrifice --yes
   failed --> [*]: coven sacrifice --yes
+  killed --> [*]: coven sacrifice --yes
   orphaned --> [*]: coven sacrifice --yes
-  archived --> [*]: coven sacrifice --yes
 ```
 
-The diagram above is normative for the v0 store. `running` sessions cannot be archived or sacrificed directly — kill them or wait for exit first. `created → running` is the only transition that requires PTY spawn; every other transition is a store-only state change managed by the Rust daemon.
+The diagram above is normative for the current store. A clean exit persists
+`idle` when `conversation_id` is set so the conversation remains extendable;
+a clean one-shot exit persists `completed`. `running` sessions cannot be
+archived or sacrificed directly — kill them or wait for exit first. Archive
+and summon change `archived_at`, not lifecycle status. `created → running` is
+the transition that establishes live execution; persistence-only transitions
+remain in the Rust authority layer.
 
 ## Launch path
 
@@ -94,7 +106,13 @@ sequenceDiagram
     Daemon-->>Client: 200 SessionRecord
     PTY-->>Store: append output / exit events
     PTY->>Daemon: process exits with code
-    Daemon->>Store: update status=completed|failed, exit_code
+    alt non-zero exit or wait error
+      Daemon->>Store: update status=failed, exit_code
+    else clean exit with conversation_id
+      Daemon->>Store: update status=idle, exit_code
+    else clean one-shot exit
+      Daemon->>Store: update status=completed, exit_code
+    end
   end
 ```
 
@@ -156,7 +174,10 @@ Use sacrifice only when the session and its logs should be removed from the loca
 
 ## Orphan recovery
 
-If the daemon starts and finds sessions that were marked `running` from a previous daemon lifetime, those sessions are marked `orphaned`.
+If the daemon starts and finds daemon-owned, non-external sessions that were
+marked `running` from a previous daemon lifetime, those sessions are marked
+`orphaned`. Registered external sessions are excluded because the daemon does
+not own their runtime.
 
 An orphaned session means Coven no longer owns a live process for that record. The event log may still be useful, but live input and kill operations should fail.
 

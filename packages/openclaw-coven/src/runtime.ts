@@ -30,7 +30,7 @@ const DEFAULT_HARNESSES: Record<string, string> = {
   claude: "claude",
   "claude-cli": "claude",
 };
-const SUPPORTED_COVEN_API_VERSION = "v1";
+const SUPPORTED_COVEN_API_CONTRACT = "coven.daemon.v1";
 const HEALTH_CHECK_TIMEOUT_MS = 5_000;
 const MAX_COVEN_PROMPT_BYTES = 500_000;
 const MIN_POLL_INTERVAL_MS = 25;
@@ -43,14 +43,21 @@ const MAX_RUNTIME_SESSION_NAME_BYTES = 2_048;
 const MAX_RUNTIME_AGENT_CHARS = 128;
 const MAX_RUNTIME_MODE_CHARS = 32;
 const MAX_STATUS_FIELD_CHARS = 256;
+const MAX_PUBLIC_API_VERSION_CHARS = 128;
 const MAX_SESSION_ID_CHARS = 128;
 const MAX_EVENT_ID_CHARS = 256;
 const SAFE_SESSION_ID_REGEX = /^[A-Za-z0-9._:-]+$/;
+const SAFE_PUBLIC_API_VERSION_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 type CovenRuntimeSessionState = {
   agent: string;
   mode: string;
   sessionMode?: string;
+};
+
+type HealthCompatibilityError = {
+  code: "COVEN_UNSUPPORTED_API_VERSION" | "COVEN_UNSUPPORTED_CAPABILITY";
+  detail: string;
 };
 
 type CovenAcpRuntimeParams = {
@@ -220,17 +227,22 @@ function normalizePollIntervalMs(value: number): number {
 
 function normalizeStopReason(value: unknown): string {
   const normalized =
-    typeof value === "string" ? sanitizeStatusText(value).toLowerCase() : "completed";
+    typeof value === "string" ? sanitizeStatusText(value).toLowerCase() : "error";
   if (normalized === "completed" || normalized === "complete" || normalized === "success") {
     return "completed";
   }
   if (normalized === "killed" || normalized === "cancelled" || normalized === "canceled") {
     return "cancelled";
   }
-  if (normalized === "failed" || normalized === "failure" || normalized === "error") {
+  if (
+    normalized === "failed" ||
+    normalized === "failure" ||
+    normalized === "error" ||
+    normalized === "orphaned"
+  ) {
     return "error";
   }
-  return "completed";
+  return "error";
 }
 
 function eventToRuntimeEvents(event: CovenEventRecord): AcpRuntimeEvent[] {
@@ -239,32 +251,28 @@ function eventToRuntimeEvents(event: CovenEventRecord): AcpRuntimeEvent[] {
     const text = typeof payload.data === "string" ? sanitizeTerminalText(payload.data) : "";
     return text ? [{ type: "text_delta", text, stream: "output", tag: "agent_message_chunk" }] : [];
   }
-  if (event.kind === "exit") {
-    const status = sanitizeStatusField(
-      typeof payload.status === "string" ? payload.status : "completed",
-      "completed",
-    );
-    const exitCode = typeof payload.exitCode === "number" ? payload.exitCode : null;
-    return [
-      {
-        type: "status",
-        text: `coven session ${status}${exitCode == null ? "" : ` exitCode=${exitCode}`}`,
-        tag: "session_info_update",
-      },
-      { type: "done", stopReason: normalizeStopReason(status) },
-    ];
-  }
-  if (event.kind === "kill") {
-    return [
-      { type: "status", text: "coven session killed", tag: "session_info_update" },
-      { type: "done", stopReason: "cancelled" },
-    ];
+  if (event.kind === "exit" || event.kind === "kill") {
+    return [];
   }
   return [];
 }
 
-function sessionIsTerminal(session: CovenSessionRecord): boolean {
-  return session.status !== "running" && session.status !== "created";
+type SessionDisposition = "nonterminal" | "terminal";
+
+function sessionDisposition(status: string): SessionDisposition {
+  switch (status) {
+    case "created":
+    case "running":
+    case "idle":
+      return "nonterminal";
+    case "completed":
+    case "failed":
+    case "killed":
+    case "orphaned":
+      return "terminal";
+    default:
+      throw new Error(`Coven daemon returned unsupported session status: ${status}`);
+  }
 }
 
 function terminalStatusEvent(session: CovenSessionRecord): AcpRuntimeEvent {
@@ -277,19 +285,67 @@ function terminalStatusEvent(session: CovenSessionRecord): AcpRuntimeEvent {
   };
 }
 
-function unsupportedApiVersionDetail(health: CovenHealthResponse): string | null {
-  if (health.apiVersion !== SUPPORTED_COVEN_API_VERSION) {
-    const actual =
-      typeof health.apiVersion === "string" && health.apiVersion ? health.apiVersion : "missing";
-    return `expected apiVersion ${SUPPORTED_COVEN_API_VERSION}, got ${actual}`;
+function describeObservedApiVersion(value: unknown): string {
+  if (value === undefined || value === "") {
+    return "missing";
   }
   if (
-    !Array.isArray(health.supportedApiVersions) ||
-    !health.supportedApiVersions.includes(SUPPORTED_COVEN_API_VERSION)
+    typeof value !== "string" ||
+    value.length > MAX_PUBLIC_API_VERSION_CHARS ||
+    !SAFE_PUBLIC_API_VERSION_REGEX.test(value)
   ) {
-    return `expected supportedApiVersions to include ${SUPPORTED_COVEN_API_VERSION}`;
+    return "invalid";
+  }
+  return value;
+}
+
+function healthCompatibilityError(health: CovenHealthResponse): HealthCompatibilityError | null {
+  if (health.apiVersion !== SUPPORTED_COVEN_API_CONTRACT) {
+    const actual = describeObservedApiVersion(health.apiVersion);
+    return {
+      code: "COVEN_UNSUPPORTED_API_VERSION",
+      detail: `expected apiVersion ${SUPPORTED_COVEN_API_CONTRACT}, got ${actual}; upgrade Coven to a compatible version`,
+    };
+  }
+  if (health.capabilities?.sessions !== true) {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail:
+        "expected capabilities.sessions to be true; upgrade Coven to a compatible version",
+    };
+  }
+  if (health.capabilities.events !== true) {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail: "expected capabilities.events to be true; upgrade Coven to a compatible version",
+    };
+  }
+  if (health.capabilities.eventCursor !== "sequence") {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail:
+        "expected capabilities.eventCursor to be sequence; upgrade Coven to a compatible version",
+    };
+  }
+  if (health.capabilities.structuredErrors !== true) {
+    return {
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      detail:
+        "expected capabilities.structuredErrors to be true; upgrade Coven to a compatible version",
+    };
   }
   return null;
+}
+
+function normalizeCovenAvailabilityError(error: unknown): AcpRuntimeError {
+  if (error instanceof AcpRuntimeError) {
+    return error;
+  }
+  return new AcpRuntimeError(
+    "ACP_BACKEND_UNAVAILABLE",
+    `Coven health check failed: ${sanitizeErrorText(error)}`,
+    { cause: error },
+  );
 }
 
 export class CovenAcpRuntime implements AcpRuntime {
@@ -316,13 +372,16 @@ export class CovenAcpRuntime implements AcpRuntime {
   ): Promise<AcpRuntimeHandle> {
     const agent = normalizeAgentId(input.agent);
     this.resolveHarness(agent);
-    if (!(await this.isCovenAvailable())) {
+    try {
+      await this.requireCovenCompatibility();
+    } catch (error) {
+      const availabilityError = normalizeCovenAvailabilityError(error);
       if (!this.config.allowFallback) {
-        throw new AcpRuntimeError(
-          "ACP_BACKEND_UNAVAILABLE",
-          "Coven is unavailable and fallback is disabled.",
-        );
+        throw availabilityError;
       }
+      this.logger?.warn(
+        `coven compatibility check failed; falling back to ${this.config.fallbackBackend}: ${sanitizeErrorText(availabilityError)}`,
+      );
       return await this.ensureFallbackSession(input);
     }
     return {
@@ -355,6 +414,7 @@ export class CovenAcpRuntime implements AcpRuntime {
     let session: CovenSessionRecord | undefined;
     let sessionId: string;
     try {
+      await this.requireCovenCompatibility(input.signal);
       const prompt = boundedCovenPrompt(input.text);
       session = await this.client.launchSession(
         {
@@ -367,6 +427,9 @@ export class CovenAcpRuntime implements AcpRuntime {
         input.signal,
       );
     } catch (error) {
+      if (input.signal?.aborted) {
+        throw input.signal.reason ?? new Error("Coven turn aborted");
+      }
       const safeError = sanitizeErrorText(error);
       if (!this.config.allowFallback) {
         throw new AcpRuntimeError(
@@ -454,7 +517,7 @@ export class CovenAcpRuntime implements AcpRuntime {
         }
 
         const latest = await this.client.getSession(sessionId, input.signal);
-        if (sessionIsTerminal(latest)) {
+        if (sessionDisposition(latest.status) === "terminal") {
           yield terminalStatusEvent(latest);
           yield { type: "done", stopReason: normalizeStopReason(latest.status) };
           this.activeSessionIdsBySessionKey.delete(input.handle.sessionKey);
@@ -514,16 +577,19 @@ export class CovenAcpRuntime implements AcpRuntime {
   async doctor(): Promise<AcpRuntimeDoctorReport> {
     try {
       const health = await this.client.health();
-      const unsupportedApiVersion = unsupportedApiVersionDetail(health);
-      if (unsupportedApiVersion) {
+      const compatibilityError = healthCompatibilityError(health);
+      if (compatibilityError) {
         return {
           ok: false,
-          code: "COVEN_UNSUPPORTED_API_VERSION",
-          message: "Coven daemon API version is not supported.",
-          details: [unsupportedApiVersion],
+          code: compatibilityError.code,
+          message:
+            compatibilityError.code === "COVEN_UNSUPPORTED_API_VERSION"
+              ? "Coven daemon API version is not supported."
+              : "Coven daemon capability is not supported.",
+          details: [compatibilityError.detail],
         };
       }
-      return health.ok
+      return health.ok === true
         ? { ok: true, message: "Coven daemon is reachable." }
         : { ok: false, code: "COVEN_UNHEALTHY", message: "Coven daemon did not report healthy." };
     } catch (error) {
@@ -565,19 +631,51 @@ export class CovenAcpRuntime implements AcpRuntime {
     await fallback?.prepareFreshSession?.(input);
   }
 
-  private async isCovenAvailable(): Promise<boolean> {
+  private async requireCovenCompatibility(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      throw signal.reason ?? new Error("Coven turn aborted");
+    }
     const controller = new AbortController();
+    const forwardCallerAbort = () => {
+      controller.abort(signal?.reason ?? new Error("Coven turn aborted"));
+    };
+    signal?.addEventListener("abort", forwardCallerAbort, { once: true });
     const timeout = setTimeout(
       () => controller.abort(new Error("Coven health check timed out")),
       HEALTH_CHECK_TIMEOUT_MS,
     );
     try {
       const health = await this.client.health(controller.signal);
-      return health.ok && unsupportedApiVersionDetail(health) === null;
-    } catch {
-      return false;
+      if (signal?.aborted) {
+        throw signal.reason ?? new Error("Coven turn aborted");
+      }
+      if (controller.signal.aborted) {
+        throw controller.signal.reason;
+      }
+      const compatibilityError = healthCompatibilityError(health);
+      if (compatibilityError) {
+        throw new AcpRuntimeError(
+          "ACP_BACKEND_UNAVAILABLE",
+          `Coven compatibility check failed: ${compatibilityError.detail}`,
+        );
+      }
+      if (health.ok !== true) {
+        throw new AcpRuntimeError(
+          "ACP_BACKEND_UNAVAILABLE",
+          "Coven daemon did not report healthy.",
+        );
+      }
+    } catch (error) {
+      if (signal?.aborted) {
+        throw signal.reason ?? new Error("Coven turn aborted");
+      }
+      if (controller.signal.aborted) {
+        throw controller.signal.reason;
+      }
+      throw error;
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", forwardCallerAbort);
     }
   }
 

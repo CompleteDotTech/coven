@@ -15,13 +15,27 @@ Coven's local API is versioned as a **named contract**. The current value is `co
 
 - New fields can be added inside an existing contract version. Clients must ignore unknown fields.
 - New endpoints can be added inside an existing contract version. Clients must not assume the full URL space is fixed.
-- New capabilities are advertised through `GET /api/v1/capabilities`.
+- Operation-group availability flags are advertised by the `capabilities`
+  object from `GET /api/v1/health`. Control-plane catalog entries, policy
+  hints, and action ids are discovered separately through
+  `GET /api/v1/capabilities`.
 - Breaking changes — field removal, type change, semantics change — require a new contract version (`coven.daemon.v2`, ...).
-- The daemon will advertise both the current and previous version during a transition.
+- Health advertises one active named contract value. A contract transition
+  requires an explicit migration plan; clients must not infer plural named
+  contract support from the legacy route-family response.
 
 ## Negotiation
 
-Read the version from `GET /api/v1/api-version` and the capability flags from `GET /api/v1/health`:
+Clients negotiate compatibility with `GET /api/v1/health`. Its `apiVersion`
+field is the named contract `coven.daemon.v1`; clients must then check every
+capability required by the operation before sending a dependent request.
+Capabilities advertise availability and never grant permission.
+
+`GET /api/v1/api-version` is a legacy route-family diagnostic. Its existing
+`apiVersion: "v1"` and `supportedApiVersions: ["v1"]` values identify the
+`/api/v1/*` route namespace, not the named compatibility contract. Existing
+values remain wire-compatible, but new clients must not use this response as
+proof of `coven.daemon.v1` support.
 
 ```http
 GET /api/v1/api-version
@@ -29,8 +43,8 @@ GET /api/v1/api-version
 
 ```json
 {
-  "apiVersion": "coven.daemon.v1",
-  "supportedApiVersions": ["coven.daemon.v1"]
+  "apiVersion": "v1",
+  "supportedApiVersions": ["v1"]
 }
 ```
 
@@ -53,7 +67,7 @@ GET /api/v1/health
     "eventCursor": "sequence",
     "structuredErrors": true
   },
-  "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "/home/alex/.coven/coven.sock" }
+  "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<covenHome>/coven.sock" }
 }
 ```
 

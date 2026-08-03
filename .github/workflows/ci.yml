@@ -78,6 +78,8 @@ jobs:
           python-version: '3.x'
       - run: python scripts/check-coven-privacy-test.py
       - run: python scripts/check-secrets-test.py
+      - run: python3 scripts/check-api-contract-docs-test.py
+      - run: python3 scripts/check-api-contract-docs.py
       - run: python scripts/check-secrets.py
       - name: Coven privacy guard (pull request changes)
         if: github.event_name == 'pull_request'
@@ -109,6 +111,25 @@ jobs:
         working-directory: packages/channels
       - run: npm test
         working-directory: packages/channels
+
+  openclaw-bridge:
+    name: OpenClaw bridge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Activate pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.11.1 --activate
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+        working-directory: packages/openclaw-coven
+      - run: pnpm run build
+        working-directory: packages/openclaw-coven
+      - run: pnpm test
+        working-directory: packages/openclaw-coven
 
   npm-onboarding-smoke:
     name: npm onboarding smoke (${{ matrix.npm-target }})

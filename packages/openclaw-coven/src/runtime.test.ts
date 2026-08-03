@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  AcpRuntimeError,
   registerAcpRuntimeBackend,
   unregisterAcpRuntimeBackend,
   type AcpRuntime,
@@ -9,7 +10,12 @@ import {
   type AcpRuntimeHandle,
 } from "openclaw/plugin-sdk/acp-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CovenClient, CovenEventRecord, CovenSessionRecord } from "./client.js";
+import type {
+  CovenClient,
+  CovenEventRecord,
+  CovenHealthResponse,
+  CovenSessionRecord,
+} from "./client.js";
 import type { ResolvedCovenPluginConfig } from "./config.js";
 import { __testing, CovenAcpRuntime } from "./runtime.js";
 
@@ -56,6 +62,7 @@ function session(overrides: Partial<CovenSessionRecord> = {}): CovenSessionRecor
 
 function event(overrides: Partial<CovenEventRecord>): CovenEventRecord {
   return {
+    seq: 1,
     id: "event-1",
     sessionId: "session-1",
     kind: "output",
@@ -65,14 +72,27 @@ function event(overrides: Partial<CovenEventRecord>): CovenEventRecord {
   };
 }
 
+function compatibleHealth(
+  overrides: Partial<CovenHealthResponse> = {},
+): CovenHealthResponse {
+  return {
+    apiVersion: "coven.daemon.v1",
+    covenVersion: "0.0.0",
+    capabilities: {
+      sessions: true,
+      events: true,
+      eventCursor: "sequence",
+      structuredErrors: true,
+    },
+    ok: true,
+    daemon: null,
+    ...overrides,
+  };
+}
+
 function fakeClient(overrides: Partial<CovenClient> = {}): CovenClient {
   return {
-    health: vi.fn(async () => ({
-      apiVersion: "v1",
-      supportedApiVersions: ["v1"],
-      ok: true,
-      daemon: null,
-    })),
+    health: vi.fn(async () => compatibleHealth()),
     launchSession: vi.fn(async () => session()),
     getSession: vi.fn(async () => session({ status: "completed", exitCode: 0 })),
     listEvents: vi.fn(async () => [
@@ -124,23 +144,31 @@ afterEach(() => {
 
 describe("CovenAcpRuntime", () => {
   it("fails closed by default when Coven is unavailable", async () => {
+    const transportError = new Error("\u001b[31moffline\r\nnow");
     const runtime = new CovenAcpRuntime({
       config,
       client: fakeClient({
         health: vi.fn(async () => {
-          throw new Error("offline");
+          throw transportError;
         }),
       }),
     });
 
-    await expect(
-      runtime.ensureSession({
+    const error = await runtime
+      .ensureSession({
         sessionKey: "agent:codex:test",
         agent: "codex",
         mode: "oneshot",
         cwd: workspaceDir,
-      }),
-    ).rejects.toThrow(/fallback is disabled/);
+      })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(AcpRuntimeError);
+    expect(error).toMatchObject({
+      code: "ACP_BACKEND_UNAVAILABLE",
+      message: "Coven health check failed: Error: offline now",
+      cause: transportError,
+    });
   });
 
   it("falls back to the direct ACP backend when Coven is unavailable and fallback is enabled", async () => {
@@ -166,7 +194,35 @@ describe("CovenAcpRuntime", () => {
     expect(fallback.ensureSession).toHaveBeenCalledOnce();
   });
 
+  it("logs sanitized compatibility failures before falling back", async () => {
+    const fallback = fallbackRuntime();
+    registerAcpRuntimeBackend({ id: "acpx", runtime: fallback });
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const launchSession = vi.fn(async () => session());
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, allowFallback: true },
+      client: fakeClient({
+        health: vi.fn(async () =>
+          compatibleHealth({ apiVersion: "\u001b[31mcoven.daemon.v2\r" }),
+        ),
+        launchSession,
+      }),
+      logger,
+    });
 
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    expect(handle.backend).toBe("acpx");
+    expect(logger.warn).toHaveBeenCalledWith(
+      "coven compatibility check failed; falling back to acpx: AcpRuntimeError: Coven compatibility check failed: expected apiVersion coven.daemon.v1, got invalid; upgrade Coven to a compatible version",
+    );
+    expect(launchSession).not.toHaveBeenCalled();
+  });
   it("rejects unavailable-Coven fallback sessions whose cwd is outside the workspace", async () => {
     const fallback = fallbackRuntime();
     registerAcpRuntimeBackend({ id: "acpx", runtime: fallback });
@@ -573,7 +629,10 @@ describe("CovenAcpRuntime", () => {
             payloadJson: JSON.stringify({ status: "completed", exitCode: 0 }),
           }),
         ]),
-      getSession: vi.fn(async () => session({ status: "running" })),
+      getSession: vi
+        .fn()
+        .mockResolvedValueOnce(session({ status: "running" }))
+        .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 })),
     });
     const runtime = new CovenAcpRuntime({ config, client });
     const handle = await runtime.ensureSession({
@@ -583,7 +642,7 @@ describe("CovenAcpRuntime", () => {
       cwd: workspaceDir,
     });
 
-    await collect(
+    const events = await collect(
       runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-1" }),
     );
 
@@ -595,6 +654,344 @@ describe("CovenAcpRuntime", () => {
       },
       undefined,
     );
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: "status", text: "coven session polling failed" }),
+    );
+    expect(client.killSession).not.toHaveBeenCalled();
+  });
+
+  it("does not treat conversational idle as one-shot completion", async () => {
+    const getSession = vi
+      .fn()
+      .mockResolvedValueOnce(session({ status: "idle" }))
+      .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 }));
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, pollIntervalMs: 25 },
+      client: fakeClient({
+        listEvents: vi.fn(async () => []),
+        getSession,
+      }),
+      sleep: vi.fn(async () => undefined),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-idle" }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "completed" });
+  });
+
+  it.each(["created", "running"])(
+    "continues polling for known nonterminal harness-session status %s",
+    async (status) => {
+      const getSession = vi
+        .fn()
+        .mockResolvedValueOnce(session({ status }))
+        .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 }));
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => []),
+          getSession,
+        }),
+        sleep: vi.fn(async () => undefined),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: `req-${status}`,
+        }),
+      );
+
+      expect(getSession).toHaveBeenCalledTimes(2);
+      expect(events.at(-1)).toEqual({ type: "done", stopReason: "completed" });
+    },
+  );
+
+  it.each([
+    ["failed", "error"],
+    ["killed", "cancelled"],
+    ["orphaned", "error"],
+  ])(
+    "terminates polling for known terminal harness-session status %s",
+    async (status, stopReason) => {
+      const getSession = vi.fn(async () => session({ status }));
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => []),
+          getSession,
+        }),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: `req-${status}`,
+        }),
+      );
+
+      expect(getSession).toHaveBeenCalledTimes(1);
+      expect(events.at(-2)).toEqual(
+        expect.objectContaining({ type: "status", text: `coven session ${status}` }),
+      );
+      expect(events.at(-1)).toEqual({ type: "done", stopReason });
+    },
+  );
+
+  it("uses persisted killed state instead of a late completed exit event", async () => {
+    const getSession = vi.fn(async () => session({ status: "killed" }));
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi.fn(async () => [
+          event({
+            kind: "exit",
+            payloadJson: JSON.stringify({ status: "completed", exitCode: 0 }),
+          }),
+        ]),
+        getSession,
+      }),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-late-exit",
+      }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(1);
+    expect(events).toEqual([
+      expect.objectContaining({ type: "status", text: "coven session session-1 started (codex)" }),
+      expect.objectContaining({ type: "status", text: "coven session killed" }),
+      { type: "done", stopReason: "cancelled" },
+    ]);
+  });
+
+  it("continues polling when an exit event arrives while persisted state is idle", async () => {
+    const getSession = vi
+      .fn()
+      .mockResolvedValueOnce(session({ status: "idle" }))
+      .mockResolvedValueOnce(session({ status: "completed", exitCode: 0 }));
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi
+          .fn()
+          .mockResolvedValueOnce([
+            event({
+              kind: "exit",
+              payloadJson: JSON.stringify({ status: "completed", exitCode: 0 }),
+            }),
+          ])
+          .mockResolvedValueOnce([]),
+        getSession,
+      }),
+      sleep: vi.fn(async () => undefined),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-idle-exit",
+      }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(events).toEqual([
+      expect.objectContaining({ type: "status", text: "coven session session-1 started (codex)" }),
+      expect.objectContaining({ type: "status", text: "coven session completed exitCode=0" }),
+      { type: "done", stopReason: "completed" },
+    ]);
+  });
+
+  it.each([
+    ["exit", "completed", "failed", "error"],
+    ["kill", "killed", "completed", "completed"],
+  ])(
+    "uses persisted ledger status instead of conflicting %s event evidence",
+    async (kind, eventStatus, ledgerStatus, stopReason) => {
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => [
+            event({
+              kind,
+              payloadJson: JSON.stringify({ status: eventStatus, exitCode: 0 }),
+            }),
+          ]),
+          getSession: vi.fn(async () => session({ status: ledgerStatus })),
+        }),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: `req-${kind}-disagreement`,
+        }),
+      );
+
+      expect(events.at(-2)).toEqual(
+        expect.objectContaining({ type: "status", text: `coven session ${ledgerStatus}` }),
+      );
+      expect(events.at(-1)).toEqual({ type: "done", stopReason });
+    },
+  );
+
+  it("does not terminate on kill event evidence before persisted killed state", async () => {
+    const getSession = vi
+      .fn()
+      .mockResolvedValueOnce(session({ status: "running" }))
+      .mockResolvedValueOnce(session({ status: "killed" }));
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi
+          .fn()
+          .mockResolvedValueOnce([event({ kind: "kill", payloadJson: "{}" })])
+          .mockResolvedValueOnce([]),
+        getSession,
+      }),
+      sleep: vi.fn(async () => undefined),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-kill-evidence",
+      }),
+    );
+
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(events.at(-2)).toEqual(
+      expect.objectContaining({ type: "status", text: "coven session killed" }),
+    );
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "cancelled" });
+  });
+
+  it.each(["future_state", "active"])(
+    "fails closed on unsupported harness-session status %s",
+    async (status) => {
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({
+          listEvents: vi.fn(async () => []),
+          getSession: vi.fn(async () => session({ status })),
+        }),
+      });
+      const handle = await runtime.ensureSession({
+        sessionKey: "agent:codex:test",
+        agent: "codex",
+        mode: "oneshot",
+        cwd: workspaceDir,
+      });
+
+      const events = await collect(
+        runtime.runTurn({
+          handle,
+          text: "Fix tests",
+          mode: "prompt",
+          requestId: "req-unknown",
+        }),
+      );
+
+      expect(events.at(-1)).toEqual({ type: "done", stopReason: "error" });
+    },
+  );
+
+  it("sanitizes and bounds unsupported-status logs while attempting cleanup", async () => {
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    const killSession = vi.fn(async () => undefined);
+    const unsafeStatus = `future\u001b]0;spoof\u0007_state\u202e${"x".repeat(500)}`;
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({
+        listEvents: vi.fn(async () => []),
+        getSession: vi.fn(async () => session({ status: unsafeStatus })),
+        killSession,
+      }),
+      logger,
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-unsafe-status",
+      }),
+    );
+
+    expect(killSession).toHaveBeenCalledWith("session-1", undefined);
+    expect(events.at(-1)).toEqual({ type: "done", stopReason: "error" });
+    const warning = vi.mocked(logger.warn).mock.calls[0]?.[0];
+    expect(warning).toEqual(expect.any(String));
+    expect(warning).not.toContain(unsafeStatus);
+    expect(warning).not.toMatch(/[\u001b\u0007\u202e\r\n]/u);
+    expect(warning?.length).toBeLessThanOrEqual(280);
   });
 
   it("fails and kills the Coven session when the daemon returns an unsafe event id", async () => {
@@ -759,10 +1156,11 @@ describe("CovenAcpRuntime", () => {
     );
   });
 
-  it("normalizes untrusted Coven exit status into bounded stop reasons", () => {
+  it("fails closed on untrusted persisted stop reasons and ignores terminal event outcomes", () => {
     expect(__testing.normalizeStopReason("completed")).toBe("completed");
     expect(__testing.normalizeStopReason("killed")).toBe("cancelled");
-    expect(__testing.normalizeStopReason("refusal")).toBe("completed");
+    expect(__testing.normalizeStopReason("orphaned")).toBe("error");
+    expect(__testing.normalizeStopReason("refusal")).toBe("error");
 
     expect(
       __testing.eventToRuntimeEvents(
@@ -771,7 +1169,10 @@ describe("CovenAcpRuntime", () => {
           payloadJson: JSON.stringify({ status: "refusal", exitCode: 0 }),
         }),
       ),
-    ).toContainEqual(expect.objectContaining({ type: "done", stopReason: "completed" }));
+    ).toEqual([]);
+    expect(
+      __testing.eventToRuntimeEvents(event({ kind: "kill", payloadJson: "{}" })),
+    ).toEqual([]);
   });
 
   it("guards daemon exitCode types before rendering terminal status text", () => {
@@ -963,16 +1364,11 @@ describe("CovenAcpRuntime", () => {
     ).rejects.toThrow(/Error: launch failed/);
   });
 
-  it("reports unsupported Coven API versions in doctor", async () => {
+  it("reports unsupported named Coven API contracts in doctor", async () => {
     const runtime = new CovenAcpRuntime({
       config,
       client: fakeClient({
-        health: vi.fn(async () => ({
-          ok: true,
-          apiVersion: "v2",
-          supportedApiVersions: ["v2"],
-          daemon: null,
-        })),
+        health: vi.fn(async () => compatibleHealth({ apiVersion: "coven.daemon.v2" })),
       }),
     });
 
@@ -980,44 +1376,128 @@ describe("CovenAcpRuntime", () => {
       ok: false,
       code: "COVEN_UNSUPPORTED_API_VERSION",
       message: "Coven daemon API version is not supported.",
-      details: ["expected apiVersion v1, got v2"],
+      details: [
+        "expected apiVersion coven.daemon.v1, got coven.daemon.v2; upgrade Coven to a compatible version",
+      ],
     });
   });
 
-  it("reports unsupported Coven supportedApiVersions in doctor", async () => {
+  it.each([
+    ["absent", undefined, "missing"],
+    ["empty", "", "missing"],
+    ["non-string", 2, "invalid"],
+    ["ANSI", "\u001b[31mcoven.daemon.v2", "invalid"],
+    ["newline", "coven.daemon.v2\nspoof", "invalid"],
+    ["bidi", "coven.daemon.v2\u202espoof", "invalid"],
+    ["oversized", `coven.daemon.${"v".repeat(1_024)}`, "invalid"],
+  ])("bounds %s Coven API version diagnostics", async (_name, apiVersion, actual) => {
     const runtime = new CovenAcpRuntime({
       config,
       client: fakeClient({
-        health: vi.fn(async () => ({
-          ok: true,
-          apiVersion: "v1",
-          supportedApiVersions: ["v2"],
-          daemon: null,
-        })),
+        health: vi.fn(async () => compatibleHealth({ apiVersion })),
       }),
     });
 
     await expect(runtime.doctor()).resolves.toMatchObject({
       ok: false,
       code: "COVEN_UNSUPPORTED_API_VERSION",
-      message: "Coven daemon API version is not supported.",
-      details: ["expected supportedApiVersions to include v1"],
+      details: [
+        `expected apiVersion coven.daemon.v1, got ${actual}; upgrade Coven to a compatible version`,
+      ],
     });
   });
 
-  it("treats missing Coven API versions as unavailable before launching sessions", async () => {
+  it.each([
+    [
+      "sessions",
+      { sessions: false },
+      "expected capabilities.sessions to be true; upgrade Coven to a compatible version",
+    ],
+    [
+      "events",
+      { events: false },
+      "expected capabilities.events to be true; upgrade Coven to a compatible version",
+    ],
+    [
+      "event cursor",
+      { eventCursor: "offset" },
+      "expected capabilities.eventCursor to be sequence; upgrade Coven to a compatible version",
+    ],
+    [
+      "structured errors",
+      { structuredErrors: false },
+      "expected capabilities.structuredErrors to be true; upgrade Coven to a compatible version",
+    ],
+  ])(
+    "fails closed when Coven reports an unsupported %s capability",
+    async (_name, override, detail) => {
+      const launchSession = vi.fn(async () => session());
+      const health = compatibleHealth({
+        capabilities: { ...compatibleHealth().capabilities, ...override },
+      });
+      const runtime = new CovenAcpRuntime({
+        config,
+        client: fakeClient({ health: vi.fn(async () => health), launchSession }),
+      });
+
+      await expect(runtime.doctor()).resolves.toMatchObject({
+        ok: false,
+        code: "COVEN_UNSUPPORTED_CAPABILITY",
+        message: "Coven daemon capability is not supported.",
+        details: [detail],
+      });
+      await expect(
+        runtime.ensureSession({
+          sessionKey: "agent:codex:test",
+          agent: "codex",
+          mode: "oneshot",
+          cwd: workspaceDir,
+        }),
+      ).rejects.toThrow(detail);
+      expect(launchSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [
+      "missing capabilities",
+      undefined,
+      "expected capabilities.sessions to be true; upgrade Coven to a compatible version",
+    ],
+    [
+      "missing sessions",
+      { events: true, eventCursor: "sequence", structuredErrors: true },
+      "expected capabilities.sessions to be true; upgrade Coven to a compatible version",
+    ],
+    [
+      "missing events",
+      { sessions: true, eventCursor: "sequence", structuredErrors: true },
+      "expected capabilities.events to be true; upgrade Coven to a compatible version",
+    ],
+    [
+      "malformed event cursor",
+      { sessions: true, events: true, eventCursor: false, structuredErrors: true },
+      "expected capabilities.eventCursor to be sequence; upgrade Coven to a compatible version",
+    ],
+    [
+      "malformed structured errors",
+      { sessions: true, events: true, eventCursor: "sequence", structuredErrors: "yes" },
+      "expected capabilities.structuredErrors to be true; upgrade Coven to a compatible version",
+    ],
+  ])("fails closed when Coven reports %s", async (_name, capabilities, detail) => {
     const launchSession = vi.fn(async () => session());
+    const health = compatibleHealth({ capabilities });
     const runtime = new CovenAcpRuntime({
       config,
-      client: fakeClient({
-        health: vi.fn(
-          async () =>
-            ({ ok: true, daemon: null }) as unknown as Awaited<ReturnType<CovenClient["health"]>>,
-        ),
-        launchSession,
-      }),
+      client: fakeClient({ health: vi.fn(async () => health), launchSession }),
     });
 
+    await expect(runtime.doctor()).resolves.toMatchObject({
+      ok: false,
+      code: "COVEN_UNSUPPORTED_CAPABILITY",
+      message: "Coven daemon capability is not supported.",
+      details: [detail],
+    });
     await expect(
       runtime.ensureSession({
         sessionKey: "agent:codex:test",
@@ -1025,8 +1505,189 @@ describe("CovenAcpRuntime", () => {
         mode: "oneshot",
         cwd: workspaceDir,
       }),
-    ).rejects.toThrow(/fallback is disabled/);
+    ).rejects.toThrow(detail);
     expect(launchSession).not.toHaveBeenCalled();
+  });
+
+  it("rechecks Coven compatibility immediately before launch", async () => {
+    const launchSession = vi.fn(async () => session());
+    const health = vi
+      .fn<CovenClient["health"]>()
+      .mockResolvedValueOnce(compatibleHealth())
+      .mockResolvedValueOnce(
+        compatibleHealth({
+          capabilities: { ...compatibleHealth().capabilities, sessions: false },
+        }),
+      );
+    const runtime = new CovenAcpRuntime({
+      config,
+      client: fakeClient({ health, launchSession }),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    await expect(
+      collect(runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-1" })),
+    ).rejects.toThrow(
+      "expected capabilities.sessions to be true; upgrade Coven to a compatible version",
+    );
+    expect(health).toHaveBeenCalledTimes(2);
+    expect(launchSession).not.toHaveBeenCalled();
+  });
+
+  it("falls back without launching when capabilities drift before launch", async () => {
+    const fallback = fallbackRuntime();
+    registerAcpRuntimeBackend({ id: "acpx", runtime: fallback });
+    const launchSession = vi.fn(async () => session());
+    const health = vi
+      .fn<CovenClient["health"]>()
+      .mockResolvedValueOnce(compatibleHealth())
+      .mockResolvedValueOnce(
+        compatibleHealth({
+          capabilities: { ...compatibleHealth().capabilities, sessions: false },
+        }),
+      );
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, allowFallback: true },
+      client: fakeClient({ health, launchSession }),
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+
+    const events = await collect(
+      runtime.runTurn({ handle, text: "Fix tests", mode: "prompt", requestId: "req-1" }),
+    );
+
+    expect(launchSession).not.toHaveBeenCalled();
+    expect(fallback.ensureSession).toHaveBeenCalledOnce();
+    expect(handle.backend).toBe("acpx");
+    expect(events).toEqual([
+      expect.objectContaining({ type: "text_delta", text: "direct fallback\n" }),
+      expect.objectContaining({ type: "done", stopReason: "complete" }),
+    ]);
+  });
+
+  it("propagates caller cancellation during the pre-launch health check without fallback", async () => {
+    const fallback = fallbackRuntime();
+    registerAcpRuntimeBackend({ id: "acpx", runtime: fallback });
+    const launchSession = vi.fn(async () => session());
+    let markSecondHealthStarted!: () => void;
+    const secondHealthStarted = new Promise<void>((resolve) => {
+      markSecondHealthStarted = resolve;
+    });
+    const health = vi
+      .fn<CovenClient["health"]>()
+      .mockResolvedValueOnce(compatibleHealth())
+      .mockImplementationOnce(
+        async (signal) =>
+          await new Promise<never>((_resolve, reject) => {
+            markSecondHealthStarted();
+            signal?.addEventListener(
+              "abort",
+              () => reject(signal.reason ?? new Error("aborted")),
+              { once: true },
+            );
+          }),
+      );
+    const client = fakeClient({ health, launchSession });
+    const runtime = new CovenAcpRuntime({
+      config: { ...config, allowFallback: true },
+      client,
+    });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+    const originalHandle = { ...handle };
+    const controller = new AbortController();
+    const removeAbortListener = vi.spyOn(controller.signal, "removeEventListener");
+    const cancellation = new Error("caller cancelled");
+    const pending = collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-1",
+        signal: controller.signal,
+      }),
+    );
+    await secondHealthStarted;
+
+    controller.abort(cancellation);
+
+    await expect(pending).rejects.toBe(cancellation);
+    expect(launchSession).not.toHaveBeenCalled();
+    expect(fallback.ensureSession).not.toHaveBeenCalled();
+    expect(handle).toEqual(originalHandle);
+    expect(removeAbortListener).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("keeps the pre-launch health deadline when a caller signal is present", async () => {
+    vi.useFakeTimers();
+    const launchSession = vi.fn(async () => session());
+    let observedSecondSignal: AbortSignal | undefined;
+    let markSecondHealthStarted!: () => void;
+    const secondHealthStarted = new Promise<void>((resolve) => {
+      markSecondHealthStarted = resolve;
+    });
+    const health = vi.fn<CovenClient["health"]>(async (signal) => {
+      if (health.mock.calls.length === 1) {
+        return compatibleHealth();
+      }
+      observedSecondSignal = signal;
+      markSecondHealthStarted();
+      return await new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(signal.reason ?? new Error("aborted")),
+          { once: true },
+        );
+      });
+    });
+    const runtime = new CovenAcpRuntime({ config, client: fakeClient({ health, launchSession }) });
+    const handle = await runtime.ensureSession({
+      sessionKey: "agent:codex:test",
+      agent: "codex",
+      mode: "oneshot",
+      cwd: workspaceDir,
+    });
+    const controller = new AbortController();
+    const pending = collect(
+      runtime.runTurn({
+        handle,
+        text: "Fix tests",
+        mode: "prompt",
+        requestId: "req-1",
+        signal: controller.signal,
+      }),
+    );
+    const settled = pending.catch((error: unknown) => error);
+    await secondHealthStarted;
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    const abortedAtDeadline = observedSecondSignal?.aborted ?? false;
+    const reasonAtDeadline = observedSecondSignal?.reason;
+    if (!abortedAtDeadline) {
+      controller.abort(new Error("test cleanup"));
+    }
+    const deadlineError = await settled;
+
+    expect(abortedAtDeadline).toBe(true);
+    expect(reasonAtDeadline).toEqual(new Error("Coven health check timed out"));
+    expect(controller.signal.aborted).toBe(false);
+    expect(deadlineError).toMatchObject({ code: "ACP_TURN_FAILED" });
+    expect(launchSession).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("falls back when Coven reports an unsupported API version and fallback is enabled", async () => {
@@ -1036,12 +1697,7 @@ describe("CovenAcpRuntime", () => {
     const runtime = new CovenAcpRuntime({
       config: { ...config, allowFallback: true },
       client: fakeClient({
-        health: vi.fn(async () => ({
-          ok: true,
-          apiVersion: "v2",
-          supportedApiVersions: ["v2"],
-          daemon: null,
-        })),
+        health: vi.fn(async () => compatibleHealth({ apiVersion: "coven.daemon.v2" })),
         launchSession,
       }),
     });
