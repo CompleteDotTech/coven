@@ -2041,15 +2041,58 @@ pub fn daemon_recovery_log_path(coven_home: &Path) -> PathBuf {
     coven_home.join("daemon-recovery.log")
 }
 
+const DAEMON_RECOVERY_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const DAEMON_RECOVERY_LOG_BACKUPS: u8 = 3;
+
+fn recovery_log_lock() -> &'static Mutex<()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 pub fn append_daemon_recovery_log(coven_home: &Path, msg: &str) {
     let path = daemon_recovery_log_path(coven_home);
     let line = format!("[{}] {}\n", crate::api::current_timestamp(), msg);
+    let _guard = recovery_log_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    rotate_recovery_log(
+        &path,
+        line.len() as u64,
+        DAEMON_RECOVERY_LOG_MAX_BYTES,
+        DAEMON_RECOVERY_LOG_BACKUPS,
+    );
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+fn rotate_recovery_log(path: &Path, incoming_bytes: u64, max_bytes: u64, backups: u8) {
+    let current_bytes = std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current_bytes.saturating_add(incoming_bytes) <= max_bytes {
+        return;
+    }
+
+    for index in (1..=backups).rev() {
+        let destination = PathBuf::from(format!("{}.{}", path.display(), index));
+        let source = if index == 1 {
+            path.to_path_buf()
+        } else {
+            PathBuf::from(format!("{}.{}", path.display(), index - 1))
+        };
+        if source.exists() {
+            // Windows does not replace an existing destination for
+            // `std::fs::rename`, unlike Unix. Only remove a slot immediately
+            // before replacing it, so a lone older archive survives a partial
+            // prior rotation where its newer source is absent.
+            let _ = std::fs::remove_file(&destination);
+            let _ = std::fs::rename(source, destination);
+        }
     }
 }
 
@@ -2073,6 +2116,42 @@ fn start_threads_proposal_scheduler(coven_home: &Path) -> Result<()> {
             }
         })
         .context("failed to spawn threads proposal scheduler")?;
+    Ok(())
+}
+
+/// Starts asynchronous, bounded SQLite retention. The initial pass waits for
+/// the interval so daemon startup never pays maintenance latency, and the
+/// store helper intentionally performs no automatic VACUUM.
+fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
+    const INTERVAL: Duration = Duration::from_secs(60);
+    const MAX_PASSES_PER_TICK: usize = 10;
+    let home = coven_home.to_path_buf();
+    std::thread::Builder::new()
+        .name("coven-store-maintenance".into())
+        .spawn(move || loop {
+            std::thread::sleep(INTERVAL);
+            let now = crate::api::current_timestamp();
+
+            // A single maintenance call can still leave backlog when
+            // per-table deletes are bounded. Run a short catch-up loop so a
+            // large retention debt cannot drift indefinitely.
+            for _ in 0..MAX_PASSES_PER_TICK {
+                match crate::store::run_scheduled_maintenance(&home, &now) {
+                    Ok(report) => {
+                        if report.raw_artifacts_pruned == 0 && report.events_pruned == 0 {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let details = format!("store maintenance pass failed: {error:#}");
+                        crate::store::record_maintenance_error(&home, &details);
+                        append_daemon_recovery_log(&home, &details);
+                        break;
+                    }
+                }
+            }
+        })
+        .context("failed to spawn store maintenance scheduler")?;
     Ok(())
 }
 
@@ -2402,6 +2481,7 @@ pub fn serve_forever(
         coven_home.to_path_buf(),
     )?);
     start_threads_proposal_scheduler(coven_home)?;
+    start_store_maintenance_scheduler(coven_home)?;
 
     if let Some(addr) = tcp_addr {
         let tcp_listener = bind_tcp_listener(addr)?;
@@ -2937,6 +3017,7 @@ pub fn serve_forever(
         coven_home.to_path_buf(),
     )?);
     start_threads_proposal_scheduler(coven_home)?;
+    start_store_maintenance_scheduler(coven_home)?;
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -5481,6 +5562,47 @@ mod tests {
         assert!(
             log.contains("second event"),
             "second append should not overwrite the first, got: {log}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_log_rotation_keeps_a_bounded_history() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = daemon_recovery_log_path(temp_dir.path());
+        std::fs::write(&path, "12345678")?;
+
+        rotate_recovery_log(&path, 4, 10, 2);
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.1", path.display()))?,
+            "12345678"
+        );
+
+        std::fs::write(&path, "abcdefgh")?;
+        rotate_recovery_log(&path, 4, 10, 2);
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.1", path.display()))?,
+            "abcdefgh"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.2", path.display()))?,
+            "12345678"
+        );
+
+        // A partial prior rotation can leave an older archive without its
+        // newer neighbor. Keep the surviving history rather than deleting it
+        // merely because there is no source to shift into its slot.
+        std::fs::remove_file(format!("{}.1", path.display()))?;
+        std::fs::write(&path, "ijklmnop")?;
+        rotate_recovery_log(&path, 4, 10, 2);
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.1", path.display()))?,
+            "ijklmnop"
+        );
+        assert_eq!(
+            std::fs::read_to_string(format!("{}.2", path.display()))?,
+            "12345678"
         );
         Ok(())
     }

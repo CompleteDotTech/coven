@@ -20,6 +20,15 @@ use crate::{
 
 const FTS_BACKFILL_BATCH_SIZE: i64 = 1_000;
 const FTS_BACKFILL_COMPLETE_KEY: &str = "events_fts_backfill_complete";
+const MAINTENANCE_LAST_PRUNE_KEY: &str = "maintenance_last_prune_at";
+const MAINTENANCE_LAST_CHECKPOINT_KEY: &str = "maintenance_last_checkpoint_at";
+const MAINTENANCE_LAST_ERROR_KEY: &str = "maintenance_last_error";
+const MAINTENANCE_EVENT_BATCH_SIZE: i64 = 500;
+const MAINTENANCE_ARTIFACT_BATCH_SIZE: i64 = 500;
+const MAINTENANCE_MAX_BATCHES_PER_TICK: i64 = 10;
+const MAINTENANCE_CHECKPOINT_WAL_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAINTENANCE_MIN_FREE_DISK_BYTES: u64 = 256 * 1024 * 1024;
+const MAINTENANCE_WARN_FREE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
 pub const DEFAULT_SESSION_PAGE_LIMIT: usize = 100;
 pub const MAX_SESSION_PAGE_LIMIT: usize = 1_000;
 
@@ -106,6 +115,40 @@ pub struct HandoffContinuationRecord {
     pub generation: i64,
     pub destination: String,
     pub created_at: String,
+}
+
+/// Storage and maintenance state exposed through the daemon health contract.
+///
+/// `writer_backlog_events` / `writer_backlog_bytes` are reported as zero here.
+/// The dedicated event writer landed in #607 after this struct was written and
+/// owns its own queue depth, surfaced separately as `eventWriter.queuedBytes`;
+/// wiring these two fields to it is tracked as follow-up rather than guessed at
+/// during a rebase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageHealth {
+    pub status: String,
+    pub database_bytes: u64,
+    pub wal_bytes: u64,
+    pub oldest_retained_event_at: Option<String>,
+    pub last_prune_at: Option<String>,
+    pub prune_age_seconds: Option<u64>,
+    pub last_checkpoint_at: Option<String>,
+    pub checkpoint_age_seconds: Option<u64>,
+    pub writer_backlog_events: u64,
+    pub writer_backlog_bytes: u64,
+    pub free_disk_bytes: u64,
+    pub maintenance_blocked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_maintenance_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledMaintenanceReport {
+    pub raw_artifacts_pruned: usize,
+    pub events_pruned: usize,
+    pub checkpoint_ran: bool,
+    pub blocked_by_free_disk: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -540,6 +583,11 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY (handoff_id) REFERENCES session_handoffs(id) ON DELETE CASCADE
         );
 
+        -- Scheduled retention walks this index in bounded oldest-first
+        -- batches. The session-scoped index above cannot serve that scan.
+        CREATE INDEX IF NOT EXISTS idx_events_created_at
+            ON events(created_at);
+
         CREATE TABLE IF NOT EXISTS sensitive_artifacts (
             id TEXT PRIMARY KEY NOT NULL,
             session_id TEXT NOT NULL,
@@ -558,6 +606,9 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_expires_at
             ON sensitive_artifacts(expires_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_created_at
+            ON sensitive_artifacts(created_at);
 
         CREATE TABLE IF NOT EXISTS repositories (
             id TEXT PRIMARY KEY NOT NULL,
@@ -933,7 +984,10 @@ fn ensure_sensitive_artifacts_table(conn: &Connection) -> Result<()> {
             ON sensitive_artifacts(session_id, created_at);
 
         CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_expires_at
-            ON sensitive_artifacts(expires_at);",
+            ON sensitive_artifacts(expires_at);
+
+        CREATE INDEX IF NOT EXISTS idx_sensitive_artifacts_created_at
+            ON sensitive_artifacts(created_at);",
     )
     .context("failed to initialize sensitive artifact schema")
 }
@@ -3334,6 +3388,311 @@ pub fn prune_events_older_than(conn: &Connection, cutoff: &str) -> Result<usize>
         .context("failed to prune events")
 }
 
+/// Delete at most one maintenance batch of expired events in a single
+/// transaction. The FTS external-content delete trigger runs in that same
+/// transaction, so a crash or interrupted process leaves both tables at the
+/// previous committed state instead of exposing a half-pruned index.
+pub fn prune_events_older_than_bounded(
+    conn: &Connection,
+    cutoff: &str,
+    limit: i64,
+) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("failed to start bounded event-prune transaction")?;
+    let pruned = tx
+        .execute(
+            "DELETE FROM events
+             WHERE rowid IN (
+                SELECT rowid FROM events
+                WHERE created_at < ?1
+                ORDER BY created_at, rowid
+                LIMIT ?2
+             )",
+            params![cutoff, limit.max(1)],
+        )
+        .context("failed to prune bounded event batch")?;
+    tx.commit()
+        .context("failed to commit bounded event-prune transaction")?;
+    Ok(pruned)
+}
+
+fn prune_sensitive_artifacts_bounded(
+    conn: &Connection,
+    now: &str,
+    retention_cutoff: &str,
+    limit: i64,
+) -> Result<usize> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("failed to start bounded artifact-prune transaction")?;
+    let pruned = tx
+        .execute(
+            "DELETE FROM sensitive_artifacts
+             WHERE rowid IN (
+                SELECT rowid FROM (
+                    -- Split predicates so each can use a supporting index while
+                    -- keeping global ordering by artifact age for bounded passes.
+                    SELECT rowid, created_at FROM sensitive_artifacts
+                    WHERE expires_at < ?1
+                    UNION
+                    SELECT rowid, created_at FROM sensitive_artifacts
+                    WHERE created_at < ?2
+                ) AS candidates
+                ORDER BY created_at, rowid
+                LIMIT ?3
+             )",
+            params![now, retention_cutoff, limit.max(1)],
+        )
+        .context("failed to prune bounded sensitive-artifact batch")?;
+    tx.commit()
+        .context("failed to commit bounded artifact-prune transaction")?;
+    Ok(pruned)
+}
+
+/// Run the daemon's bounded retention tick. It deliberately never invokes
+/// `VACUUM`: compaction remains an explicit operator action because it can
+/// monopolize the database and violate session-launch latency expectations.
+pub fn run_scheduled_maintenance(
+    coven_home: &Path,
+    now: &str,
+) -> Result<ScheduledMaintenanceReport> {
+    let free_disk_bytes = fs2::available_space(coven_home)
+        .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
+    let config =
+        privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
+    run_scheduled_maintenance_with_config_and_free_disk(coven_home, now, free_disk_bytes, &config)
+}
+
+#[cfg(test)]
+fn run_scheduled_maintenance_with_free_disk(
+    coven_home: &Path,
+    now: &str,
+    free_disk_bytes: u64,
+) -> Result<ScheduledMaintenanceReport> {
+    run_scheduled_maintenance_with_config_and_free_disk(
+        coven_home,
+        now,
+        free_disk_bytes,
+        &PrivacyConfig::default(),
+    )
+}
+
+fn run_scheduled_maintenance_with_config_and_free_disk(
+    coven_home: &Path,
+    now: &str,
+    free_disk_bytes: u64,
+    config: &PrivacyConfig,
+) -> Result<ScheduledMaintenanceReport> {
+    if free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES {
+        // Do not record this in SQLite: opening a write transaction here would
+        // add WAL pressure precisely when the watermark is meant to prevent it.
+        // `storage_health` derives the blocked state from free disk directly.
+        return Ok(ScheduledMaintenanceReport {
+            raw_artifacts_pruned: 0,
+            events_pruned: 0,
+            checkpoint_ran: false,
+            blocked_by_free_disk: true,
+        });
+    }
+
+    let raw_cutoff = retention_cutoff(now, config.raw_artifact_retention_days.max(1));
+    let event_cutoff = retention_cutoff(now, config.log_retention_days.max(1));
+    let store_path = coven_home.join("coven.sqlite3");
+    let conn = open_store(&store_path)?;
+    let mut raw_artifacts_pruned = 0usize;
+    let mut events_pruned = 0usize;
+
+    for _ in 0..MAINTENANCE_MAX_BATCHES_PER_TICK {
+        let raw_batch = prune_sensitive_artifacts_bounded(
+            &conn,
+            now,
+            &raw_cutoff,
+            MAINTENANCE_ARTIFACT_BATCH_SIZE,
+        )?;
+        let event_batch =
+            prune_events_older_than_bounded(&conn, &event_cutoff, MAINTENANCE_EVENT_BATCH_SIZE)?;
+
+        raw_artifacts_pruned += raw_batch;
+        events_pruned += event_batch;
+
+        // Convergence loop keeps startup backlog from stalling one minute behind
+        // while still enforcing a predictable per-tick upper bound.
+        // The prune helpers report rows deleted as `usize`; the batch bounds are
+        // `i64` because they are bound directly to SQL `LIMIT`. Compare in `i64`
+        // rather than widening the constants, so the value handed to SQLite and
+        // the value compared here stay the same type.
+        if (raw_batch as i64) < MAINTENANCE_ARTIFACT_BATCH_SIZE
+            && (event_batch as i64) < MAINTENANCE_EVENT_BATCH_SIZE
+        {
+            break;
+        }
+    }
+
+    // Record a successful pass even when nothing was expired. Operators need
+    // the age of the maintenance loop itself, not merely the most recent row
+    // deletion, to tell a healthy empty ledger from a stalled scheduler.
+    set_store_meta(&conn, MAINTENANCE_LAST_PRUNE_KEY, now)?;
+
+    let wal_bytes = file_size(&wal_path(&store_path));
+    let checkpoint_ran = if wal_bytes >= MAINTENANCE_CHECKPOINT_WAL_BYTES {
+        // PASSIVE does as much as it can without waiting on a reader or writer.
+        // A blocked checkpoint is still harmless; the WAL size remains visible
+        // through `StorageHealth` for an operator to investigate.
+        let _ = conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        set_store_meta(&conn, MAINTENANCE_LAST_CHECKPOINT_KEY, now)?;
+        true
+    } else {
+        false
+    };
+    set_store_meta(&conn, MAINTENANCE_LAST_ERROR_KEY, "")?;
+
+    Ok(ScheduledMaintenanceReport {
+        raw_artifacts_pruned,
+        events_pruned,
+        checkpoint_ran,
+        blocked_by_free_disk: false,
+    })
+}
+
+/// Gather storage pressure without mutating the database. Health callers use
+/// this after daemon startup has initialized the schema.
+pub fn storage_health(coven_home: &Path) -> Result<StorageHealth> {
+    let store_path = coven_home.join("coven.sqlite3");
+    let conn = open_store(&store_path)?;
+    let free_disk_bytes = fs2::available_space(coven_home)
+        .with_context(|| format!("failed to inspect free disk for {}", coven_home.display()))?;
+    let config =
+        privacy::load_with_settings(coven_home, crate::settings::cached()).unwrap_or_default();
+    // `MIN(created_at)` is NULL on an empty ledger, so the column type has to be
+    // stated: `row.get` cannot infer `Option<String>` from the comparison below.
+    let oldest_retained_event_at: Option<String> = conn
+        .query_row("SELECT MIN(created_at) FROM events", [], |row| row.get(0))
+        .context("failed to read oldest retained event")?;
+    let retention_cutoff = retention_cutoff(
+        &Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true),
+        config.log_retention_days.max(1),
+    );
+    let retention_cutoff = parse_rfc3339_utc(&retention_cutoff);
+    let retention_lagging = oldest_retained_event_at
+        .as_deref()
+        .and_then(parse_rfc3339_utc)
+        .zip(retention_cutoff)
+        .is_some_and(|(oldest_at, retention_cutoff)| oldest_at < retention_cutoff);
+    let last_prune_at = get_store_meta(&conn, MAINTENANCE_LAST_PRUNE_KEY)?;
+    let last_checkpoint_at = get_store_meta(&conn, MAINTENANCE_LAST_CHECKPOINT_KEY)?;
+    let last_maintenance_error =
+        get_store_meta(&conn, MAINTENANCE_LAST_ERROR_KEY)?.filter(|value| !value.is_empty());
+    let database_bytes = file_size(&store_path);
+    let wal_bytes = file_size(&wal_path(&store_path));
+    let maintenance_blocked = free_disk_bytes < MAINTENANCE_MIN_FREE_DISK_BYTES;
+    let status = if maintenance_blocked {
+        "critical"
+    } else if retention_lagging
+        || free_disk_bytes < MAINTENANCE_WARN_FREE_DISK_BYTES
+        || wal_bytes >= MAINTENANCE_CHECKPOINT_WAL_BYTES
+        || last_maintenance_error.is_some()
+    {
+        "warning"
+    } else {
+        "ok"
+    };
+
+    Ok(StorageHealth {
+        status: status.to_string(),
+        database_bytes,
+        wal_bytes,
+        oldest_retained_event_at,
+        prune_age_seconds: maintenance_age_seconds(last_prune_at.as_deref()),
+        last_prune_at,
+        checkpoint_age_seconds: maintenance_age_seconds(last_checkpoint_at.as_deref()),
+        last_checkpoint_at,
+        writer_backlog_events: 0,
+        writer_backlog_bytes: 0,
+        free_disk_bytes,
+        maintenance_blocked,
+        last_maintenance_error,
+    })
+}
+
+pub fn unavailable_storage_health(_error: impl ToString) -> StorageHealth {
+    StorageHealth {
+        status: "degraded".to_string(),
+        database_bytes: 0,
+        wal_bytes: 0,
+        oldest_retained_event_at: None,
+        last_prune_at: None,
+        prune_age_seconds: None,
+        last_checkpoint_at: None,
+        checkpoint_age_seconds: None,
+        writer_backlog_events: 0,
+        writer_backlog_bytes: 0,
+        free_disk_bytes: 0,
+        maintenance_blocked: true,
+        // The socket API is a compatibility boundary. Do not turn an I/O
+        // failure into a COVEN_HOME path disclosure; detailed diagnostics stay
+        // in the local recovery log.
+        last_maintenance_error: Some("storage health unavailable".to_string()),
+    }
+}
+
+pub fn record_maintenance_error(coven_home: &Path, error: impl ToString) {
+    if let Ok(conn) = open_store(&coven_home.join("coven.sqlite3")) {
+        let _ = set_store_meta(&conn, MAINTENANCE_LAST_ERROR_KEY, &error.to_string());
+    }
+}
+
+fn maintenance_age_seconds(timestamp: Option<&str>) -> Option<u64> {
+    let timestamp = timestamp?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(timestamp).ok()?;
+    (Utc::now() - parsed.with_timezone(&Utc))
+        .to_std()
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn parse_rfc3339_utc(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+}
+
+fn wal_path(store_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-wal", store_path.display()))
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn get_store_meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM store_meta WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .optional()
+    .with_context(|| format!("failed to read store metadata key {key}"))
+}
+
+fn set_store_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO store_meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .with_context(|| format!("failed to update store metadata key {key}"))?;
+    Ok(())
+}
+
 pub fn retention_cutoff(now: &str, days: u64) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(now)
         .map(|dt| dt.with_timezone(&Utc))
@@ -4542,6 +4901,271 @@ mod tests {
         let events = list_events(&conn, "session-1")?;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].payload_json, r#"{"data":"fresh-event"}"#);
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_event_pruning_keeps_fts_consistent_across_an_interruption() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        for id in ["old-one", "old-two", "old-three"] {
+            insert_event(
+                &conn,
+                &EventRecord {
+                    seq: 0,
+                    id: id.to_string(),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json: serde_json::json!({ "data": id }).to_string(),
+                    created_at: "2026-04-01T00:00:00Z".to_string(),
+                },
+            )?;
+        }
+
+        // Model a process interruption after the DELETE starts but before its
+        // transaction commits. Dropping the transaction must restore both the
+        // events table and the FTS trigger side effects.
+        {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "DELETE FROM events WHERE rowid IN (
+                    SELECT rowid FROM events WHERE created_at < ?1 LIMIT 1
+                 )",
+                ["2026-04-15T00:00:00Z"],
+            )?;
+        }
+        assert_eq!(search_events(&conn, "old-one")?.len(), 1);
+
+        let pruned = prune_events_older_than_bounded(&conn, "2026-04-15T00:00:00Z", 2)?;
+        assert_eq!(pruned, 2);
+        assert_eq!(list_events(&conn, "session-1")?.len(), 1);
+        assert_eq!(search_events(&conn, "old-one")?.len(), 0);
+        assert_eq!(pragma_integrity_check(&conn)?, vec!["ok"]);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_prunes_retention_without_vacuuming() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "expired".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"expired"}"#.to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+            },
+        )?;
+        drop(conn);
+
+        let report = run_scheduled_maintenance_with_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_WARN_FREE_DISK_BYTES,
+        )?;
+        assert_eq!(report.events_pruned, 1);
+        assert!(!report.checkpoint_ran);
+        assert!(!report.blocked_by_free_disk);
+
+        let health = storage_health(home)?;
+        assert_eq!(
+            health.last_prune_at.as_deref(),
+            Some("2026-04-27T06:00:00Z")
+        );
+        assert_eq!(health.oldest_retained_event_at, None);
+        assert_eq!(health.writer_backlog_events, 0);
+        assert_eq!(health.writer_backlog_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_honors_configured_event_retention() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "configured-expired".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"expired"}"#.to_string(),
+                created_at: "2026-04-25T00:00:00Z".to_string(),
+            },
+        )?;
+        drop(conn);
+
+        let config = PrivacyConfig {
+            persist_raw_artifacts: false,
+            raw_artifact_retention_days: 7,
+            log_retention_days: 1,
+            extra_patterns: Vec::new(),
+        };
+        let report = run_scheduled_maintenance_with_config_and_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_MIN_FREE_DISK_BYTES,
+            &config,
+        )?;
+
+        assert_eq!(report.events_pruned, 1);
+        let conn = open_store(&path)?;
+        assert!(list_events(&conn, "session-1")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_below_watermark_does_not_open_or_write_the_store() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+
+        let report = run_scheduled_maintenance_with_free_disk(
+            home,
+            "2026-04-27T06:00:00Z",
+            MAINTENANCE_MIN_FREE_DISK_BYTES - 1,
+        )?;
+
+        assert!(report.blocked_by_free_disk);
+        assert_eq!(report.events_pruned, 0);
+        assert_eq!(report.raw_artifacts_pruned, 0);
+        assert!(
+            !home.join("coven.sqlite3").exists(),
+            "the safety path must not create a database or WAL writes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn thirty_day_synthetic_workload_converges_to_a_stable_store_size() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-01-01T00:00:00Z"))?;
+        drop(conn);
+
+        let payload = "x".repeat(2_048);
+        let mut pages_at_steady_state = None;
+        let start =
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")?.with_timezone(&Utc);
+        for day in 0..65 {
+            let created_at =
+                (start + Duration::days(day)).to_rfc3339_opts(SecondsFormat::Nanos, true);
+            let conn = open_store(&path)?;
+            insert_event(
+                &conn,
+                &EventRecord {
+                    seq: 0,
+                    id: format!("event-{day}"),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json: serde_json::json!({ "data": payload }).to_string(),
+                    created_at: created_at.clone(),
+                },
+            )?;
+            drop(conn);
+            run_scheduled_maintenance_with_free_disk(
+                home,
+                &created_at,
+                MAINTENANCE_WARN_FREE_DISK_BYTES,
+            )?;
+
+            if day == 45 {
+                let conn = open_store(&path)?;
+                pages_at_steady_state =
+                    Some(conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?);
+            }
+        }
+
+        let conn = open_store(&path)?;
+        let retained: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let final_pages: i64 =
+            conn.query_row("PRAGMA page_count", [], |row| row.get::<_, i64>(0))?;
+        assert!(
+            retained <= 31,
+            "retention must bound a daily 30-day workload"
+        );
+        assert!(
+            final_pages <= pages_at_steady_state.expect("steady-state sample") + 2,
+            "page count should converge once expiration matches ingestion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_maintenance_catches_up_after_backlog() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2026-01-01T00:00:00Z"))?;
+        for day in 0..1200 {
+            insert_event(
+                &conn,
+                &EventRecord {
+                    seq: 0,
+                    id: format!("event-{day}"),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json: serde_json::json!({ "data": day }).to_string(),
+                    created_at: "2025-01-01T00:00:00Z".to_string(),
+                },
+            )?;
+        }
+        drop(conn);
+
+        let report = run_scheduled_maintenance_with_free_disk(
+            home,
+            "2026-01-31T00:00:00Z",
+            MAINTENANCE_WARN_FREE_DISK_BYTES,
+        )?;
+        assert!(
+            report.events_pruned > MAINTENANCE_EVENT_BATCH_SIZE as usize,
+            "single tick should advance through multiple bounded maintenance batches"
+        );
+
+        let conn = open_store(&path)?;
+        let retained: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        assert_eq!(retained, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_flags_stale_retention() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let path = home.join("coven.sqlite3");
+        let conn = open_store(&path)?;
+        insert_session(&conn, &session_record("session-1", "2010-01-01T00:00:00Z"))?;
+        insert_event(
+            &conn,
+            &EventRecord {
+                seq: 0,
+                id: "ancient".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: r#"{"data":"ancient"}"#.to_string(),
+                created_at: "2010-01-01T00:00:00Z".to_string(),
+            },
+        )?;
+
+        let health = storage_health(home)?;
+        assert_eq!(
+            health.oldest_retained_event_at.as_deref(),
+            Some("2010-01-01T00:00:00Z")
+        );
+        assert_ne!(health.status, "ok");
         Ok(())
     }
 
