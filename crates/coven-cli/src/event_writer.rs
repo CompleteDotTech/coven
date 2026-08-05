@@ -7,7 +7,7 @@
 //! be overtaken by a following exit event.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{mpsc, Arc, Condvar, Mutex},
     thread,
@@ -67,6 +67,14 @@ struct Queue {
     queued_events: usize,
     queued_bytes: usize,
     failed: Option<String>,
+    truncations: HashMap<String, OutputTruncation>,
+    closing_sessions: HashSet<String>,
+}
+
+struct OutputTruncation {
+    dropped_events: u64,
+    dropped_bytes: u64,
+    created_at: String,
 }
 
 struct QueuedEvent {
@@ -89,6 +97,15 @@ enum PendingEvent {
     },
 }
 
+impl PendingEvent {
+    fn session_id(&self) -> &str {
+        match self {
+            Self::Output { session_id, .. } | Self::Exit { session_id, .. } => session_id,
+            Self::Record(record) => &record.session_id,
+        }
+    }
+}
+
 impl EventWriter {
     pub fn start(coven_home: PathBuf) -> Result<Self> {
         Self::start_with_capacity(coven_home, DEFAULT_CAPACITY_BYTES)
@@ -105,6 +122,8 @@ impl EventWriter {
                 queued_events: 0,
                 queued_bytes: 0,
                 failed: None,
+                truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes,
@@ -200,14 +219,41 @@ impl EventWriter {
         if let Some(error) = &queue.failed {
             return Err(anyhow!(error.clone()));
         }
-        if bytes > self.shared.output_capacity_bytes
+        let (session_id, dropped_bytes, created_at) = match &event {
+            PendingEvent::Output {
+                session_id,
+                data,
+                created_at,
+            } => (session_id, data.len(), created_at),
+            _ => unreachable!("enqueue_output only accepts output events"),
+        };
+        if queue.closing_sessions.contains(session_id)
+            || bytes > self.shared.output_capacity_bytes
             || queue.queued_bytes.saturating_add(bytes) > self.shared.output_capacity_bytes
         {
+            record_output_drop(&mut queue, session_id, dropped_bytes, created_at);
             let mut health = self.lock_health();
             health.state = "pressured".to_string();
-            health.dropped_output_events += 1;
-            health.dropped_output_bytes += bytes.saturating_sub(EVENT_OVERHEAD_BYTES) as u64;
+            health.dropped_output_events = health.dropped_output_events.saturating_add(1);
+            health.dropped_output_bytes = health
+                .dropped_output_bytes
+                .saturating_add(dropped_bytes as u64);
             return Ok(false);
+        }
+        let marker = take_truncation_marker(&mut queue, session_id);
+        let marker_bytes = marker.as_ref().map_or(0, |item| item.bytes);
+        anyhow::ensure!(
+            queue
+                .queued_bytes
+                .saturating_add(marker_bytes)
+                .saturating_add(bytes)
+                <= self.shared.capacity_bytes,
+            "accepted output exceeded event writer capacity"
+        );
+        if let Some(marker) = marker {
+            queue.queued_events += 1;
+            queue.queued_bytes += marker.bytes;
+            queue.items.push_back(marker);
         }
         queue.queued_events += 1;
         queue.queued_bytes += bytes;
@@ -226,6 +272,115 @@ impl EventWriter {
             bytes <= self.shared.capacity_bytes,
             "critical event exceeds event writer capacity"
         );
+        let session_id = event.session_id().to_string();
+        let marker = {
+            let mut queue = self.lock_queue();
+            loop {
+                if let Some(error) = &queue.failed {
+                    return Err(anyhow!(error.clone()));
+                }
+                if queue.closing_sessions.insert(session_id.clone()) {
+                    break take_truncation_marker(&mut queue, &session_id);
+                }
+                queue = self
+                    .shared
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+
+        let result = self.enqueue_closed_critical(event, bytes, marker);
+        let mut queue = self.lock_queue();
+        queue.closing_sessions.remove(&session_id);
+        self.shared.available.notify_all();
+        result
+    }
+
+    fn enqueue_closed_critical(
+        &self,
+        event: PendingEvent,
+        bytes: usize,
+        marker: Option<QueuedEvent>,
+    ) -> Result<()> {
+        let (completion_tx, completion_rx) = mpsc::sync_channel(1);
+        let mut queue = self.lock_queue();
+        if let Some(error) = &queue.failed {
+            return Err(anyhow!(error.clone()));
+        }
+        let marker_bytes = marker.as_ref().map_or(0, |item| item.bytes);
+        if marker_bytes.saturating_add(bytes) <= self.shared.capacity_bytes {
+            loop {
+                if let Some(error) = &queue.failed {
+                    return Err(anyhow!(error.clone()));
+                }
+                if queue
+                    .queued_bytes
+                    .saturating_add(marker_bytes)
+                    .saturating_add(bytes)
+                    <= self.shared.capacity_bytes
+                {
+                    break;
+                }
+                queue = self
+                    .shared
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+
+            if let Some(marker) = marker {
+                queue.queued_events += 1;
+                queue.queued_bytes += marker.bytes;
+                queue.items.push_back(marker);
+            }
+            queue.queued_events += 1;
+            queue.queued_bytes += bytes;
+            self.update_queue_health(queue.queued_events, queue.queued_bytes);
+            queue.items.push_back(QueuedEvent {
+                event,
+                bytes,
+                completion: Some(completion_tx),
+            });
+            self.shared.available.notify_one();
+            drop(queue);
+            receive_completion(
+                completion_rx,
+                "event writer stopped before committing a critical event",
+            )
+        } else {
+            let mut marker =
+                marker.expect("marker is required when combined capacity is impossible");
+            let (marker_tx, marker_rx) = mpsc::sync_channel(1);
+            loop {
+                if let Some(error) = &queue.failed {
+                    return Err(anyhow!(error.clone()));
+                }
+                if queue.queued_bytes.saturating_add(marker.bytes) <= self.shared.capacity_bytes {
+                    break;
+                }
+                queue = self
+                    .shared
+                    .available
+                    .wait(queue)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            marker.completion = Some(marker_tx);
+            queue.queued_events += 1;
+            queue.queued_bytes += marker.bytes;
+            queue.items.push_back(marker);
+            self.update_queue_health(queue.queued_events, queue.queued_bytes);
+            self.shared.available.notify_one();
+            drop(queue);
+            receive_completion(
+                marker_rx,
+                "event writer stopped before committing truncation marker",
+            )?;
+            self.enqueue_closed_critical_event(event, bytes)
+        }
+    }
+
+    fn enqueue_closed_critical_event(&self, event: PendingEvent, bytes: usize) -> Result<()> {
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
         let mut queue = self.lock_queue();
         loop {
@@ -251,13 +406,10 @@ impl EventWriter {
         });
         self.shared.available.notify_one();
         drop(queue);
-        match completion_rx
-            .recv()
-            .context("event writer stopped before committing a critical event")?
-        {
-            Ok(()) => Ok(()),
-            Err(message) => Err(anyhow!(message)),
-        }
+        receive_completion(
+            completion_rx,
+            "event writer stopped before committing a critical event",
+        )
     }
 
     fn lock_queue(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -465,6 +617,43 @@ fn output_record(session_id: &str, data: &str, created_at: &str) -> Result<store
     })
 }
 
+fn record_output_drop(queue: &mut Queue, session_id: &str, dropped_bytes: usize, created_at: &str) {
+    let truncation = queue
+        .truncations
+        .entry(session_id.to_string())
+        .or_insert_with(|| OutputTruncation {
+            dropped_events: 0,
+            dropped_bytes: 0,
+            created_at: created_at.to_string(),
+        });
+    truncation.dropped_events = truncation.dropped_events.saturating_add(1);
+    truncation.dropped_bytes = truncation
+        .dropped_bytes
+        .saturating_add(dropped_bytes as u64);
+}
+
+fn take_truncation_marker(queue: &mut Queue, session_id: &str) -> Option<QueuedEvent> {
+    let truncation = queue.truncations.remove(session_id)?;
+    let payload_json = serde_json::to_string(&json!({
+        "droppedEvents": truncation.dropped_events,
+        "droppedBytes": truncation.dropped_bytes,
+    }))
+    .expect("truncation marker payload is always serializable");
+    let bytes = payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES);
+    Some(QueuedEvent {
+        event: PendingEvent::Record(store::EventRecord {
+            seq: 0,
+            id: Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            kind: "output_truncated".to_string(),
+            payload_json,
+            created_at: truncation.created_at,
+        }),
+        bytes,
+        completion: None,
+    })
+}
+
 fn flush_output(
     conn: &Connection,
     coven_home: &std::path::Path,
@@ -539,9 +728,21 @@ fn complete(batch: &[QueuedEvent], result: std::result::Result<(), String>) {
     }
 }
 
+fn receive_completion(
+    receiver: mpsc::Receiver<std::result::Result<(), String>>,
+    context: &'static str,
+) -> Result<()> {
+    match receiver.recv().context(context)? {
+        Ok(()) => Ok(()),
+        Err(message) => Err(anyhow!(message)),
+    }
+}
+
 fn fail_writer(shared: &Arc<Shared>, message: String) -> Vec<QueuedEvent> {
     let mut queue = lock_queue(shared);
     queue.failed = Some(message.clone());
+    queue.truncations.clear();
+    queue.closing_sessions.clear();
     queue.queued_events = 0;
     queue.queued_bytes = 0;
     let pending = queue.items.drain(..).collect();
@@ -682,6 +883,8 @@ mod tests {
                 queued_events: 2,
                 queued_bytes: EVENT_OVERHEAD_BYTES * 2,
                 failed: None,
+                truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -715,6 +918,8 @@ mod tests {
                 queued_events: 0,
                 queued_bytes: 0,
                 failed: None,
+                truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
@@ -753,6 +958,145 @@ mod tests {
         let health = lock_health(&shared);
         assert_eq!(health.queued_events, 1);
         assert_eq!(health.queued_bytes, EVENT_OVERHEAD_BYTES + "hello".len());
+        Ok(())
+    }
+
+    #[test]
+    fn critical_boundary_prevents_same_session_output_from_overtaking_marker() -> Result<()> {
+        let capacity = RESERVED_CRITICAL_BYTES + 1024;
+        let blocked_bytes = capacity - 256;
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue {
+                items: VecDeque::from([QueuedEvent {
+                    event: PendingEvent::Output {
+                        session_id: "other".to_string(),
+                        data: "blocked".to_string(),
+                        created_at: "2026-08-04T00:00:00Z".to_string(),
+                    },
+                    bytes: blocked_bytes,
+                    completion: None,
+                }]),
+                queued_events: 1,
+                queued_bytes: blocked_bytes,
+                failed: None,
+                truncations: HashMap::from([(
+                    "s-1".to_string(),
+                    OutputTruncation {
+                        dropped_events: 1,
+                        dropped_bytes: 2048,
+                        created_at: "2026-08-04T00:00:01Z".to_string(),
+                    },
+                )]),
+                closing_sessions: HashSet::new(),
+            }),
+            available: Condvar::new(),
+            capacity_bytes: capacity,
+            output_capacity_bytes: capacity - RESERVED_CRITICAL_BYTES,
+            health: Mutex::new(EventWriterHealth {
+                state: "pressured".to_string(),
+                queued_events: 1,
+                queued_bytes: blocked_bytes,
+                capacity_bytes: capacity,
+                dropped_output_events: 1,
+                dropped_output_bytes: 2048,
+                connection_opens: 0,
+                transactions: 0,
+                committed_events: 0,
+                last_error: None,
+            }),
+        });
+        let writer = EventWriter {
+            shared: Arc::clone(&shared),
+        };
+        let critical_writer = writer.clone();
+        let critical = thread::spawn(move || {
+            critical_writer.enqueue_critical(
+                PendingEvent::Record(store::EventRecord {
+                    seq: 0,
+                    id: "critical".to_string(),
+                    session_id: "s-1".to_string(),
+                    kind: "tool_result".to_string(),
+                    payload_json: "{}".to_string(),
+                    created_at: "2026-08-04T00:00:02Z".to_string(),
+                }),
+                EVENT_OVERHEAD_BYTES,
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if lock_queue(&shared).closing_sessions.contains("s-1") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "critical event did not claim its session boundary"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(!writer.enqueue_output(
+            PendingEvent::Output {
+                session_id: "s-1".to_string(),
+                data: "later".to_string(),
+                created_at: "2026-08-04T00:00:03Z".to_string(),
+            },
+            EVENT_OVERHEAD_BYTES + "later".len(),
+        )?);
+
+        {
+            let mut queue = lock_queue(&shared);
+            queue.items.clear();
+            queue.queued_events = 0;
+            queue.queued_bytes = 0;
+            shared.available.notify_all();
+        }
+
+        let queued = loop {
+            let mut queue = lock_queue(&shared);
+            if queue.items.len() == 2 {
+                queue.queued_events = 0;
+                queue.queued_bytes = 0;
+                break queue.items.drain(..).collect::<Vec<_>>();
+            }
+            drop(queue);
+            assert!(
+                Instant::now() < deadline,
+                "critical boundary events were not queued"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            queued
+                .iter()
+                .map(|item| match &item.event {
+                    PendingEvent::Record(record) => record.kind.as_str(),
+                    _ => "unexpected",
+                })
+                .collect::<Vec<_>>(),
+            ["output_truncated", "tool_result"]
+        );
+        let marker = match &queued[0].event {
+            PendingEvent::Record(record) => {
+                serde_json::from_str::<serde_json::Value>(&record.payload_json)?
+            }
+            _ => unreachable!("first boundary event must be the truncation marker"),
+        };
+        assert_eq!(marker["droppedEvents"], 1);
+        assert_eq!(marker["droppedBytes"], 2048);
+        let queue = lock_queue(&shared);
+        let later_episode = queue
+            .truncations
+            .get("s-1")
+            .expect("output after the claimed boundary starts the next episode");
+        assert_eq!(later_episode.dropped_events, 1);
+        assert_eq!(later_episode.dropped_bytes, 5);
+        drop(queue);
+
+        complete(&queued, Ok(()));
+        critical.join().expect("critical producer panicked")?;
+        assert!(!lock_queue(&shared).closing_sessions.contains("s-1"));
         Ok(())
     }
 
@@ -882,6 +1226,174 @@ mod tests {
     }
 
     #[test]
+    fn exit_closes_pressure_episode_before_terminal_event() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "failed",
+                exit_code: Some(1),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "exit"]
+        );
+        let marker_payload: serde_json::Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(marker_payload["droppedEvents"], 1);
+        assert_eq!(marker_payload["droppedBytes"], 2048);
+        Ok(())
+    }
+
+    #[test]
+    fn pressure_episodes_are_isolated_per_session() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        store::insert_session(&conn, &session("s-2"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(!writer.record_output("s-2", "x".repeat(3072))?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+        writer.record_exit(
+            "s-2",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        for (session_id, dropped_bytes) in [("s-1", 2048), ("s-2", 3072)] {
+            let events = store::list_events(&conn, session_id)?;
+            assert_eq!(events[0].kind, "output_truncated");
+            let marker_payload: serde_json::Value = serde_json::from_str(&events[0].payload_json)?;
+            assert_eq!(marker_payload["droppedEvents"], 1);
+            assert_eq!(marker_payload["droppedBytes"], dropped_bytes);
+            assert_eq!(events[1].kind, "exit");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_critical_event_commits_marker_before_waiting_for_its_own_capacity() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let capacity = RESERVED_CRITICAL_BYTES + 1024;
+        let writer = EventWriter::start_with_capacity(home.path().to_path_buf(), capacity)?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        let record = store::EventRecord {
+            seq: 0,
+            id: "event".to_string(),
+            session_id: "s-1".to_string(),
+            kind: "error".to_string(),
+            payload_json: "{}".to_string(),
+            created_at: "2026-08-04T00:00:00Z".to_string(),
+        };
+        writer.enqueue_critical(PendingEvent::Record(record), capacity - 1)?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "error"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_output_is_preceded_by_one_exact_truncation_marker() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(!writer.record_output("s-1", "x".repeat(3072))?);
+        assert!(writer.record_output("s-1", "recovered".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output_truncated", "output", "exit"]
+        );
+        let marker_payload: serde_json::Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(marker_payload["droppedEvents"], 2);
+        assert_eq!(marker_payload["droppedBytes"], 5120);
+        assert!(events[0].created_at <= events[1].created_at);
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_output_without_pressure_has_no_truncation_marker() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        assert!(writer.record_output("s-1", "accepted".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["output", "exit"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn writer_failure_drains_queued_critical_completions() {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue {
@@ -889,6 +1401,8 @@ mod tests {
                 queued_events: 1,
                 queued_bytes: EVENT_OVERHEAD_BYTES,
                 failed: None,
+                truncations: HashMap::new(),
+                closing_sessions: HashSet::new(),
             }),
             available: Condvar::new(),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
