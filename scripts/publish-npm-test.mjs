@@ -17,8 +17,10 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { defaultTargetName, isMainModule, isOidcContext, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { defaultTargetName, isMainModule, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 import { parseReleaseTag } from './release-npm-context.mjs';
+import { nativePackageSet } from './release-npm-recovery-contract.mjs';
+import { platformMatrix } from './release-npm-platform-matrix.mjs';
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
@@ -56,6 +58,30 @@ test('parseReleaseTag rejects malformed and unrelated prerelease tags', () => {
       /stable vX.Y.Z tag or vX.Y.Z-recovery.N/
     );
   }
+});
+
+test('nativePackageSet accepts only complete historical native package sets', () => {
+  assert.equal(
+    nativePackageSet({
+      '@opencoven/cli-macos': '0.0.0',
+      '@opencoven/cli-linux-x64': '0.0.0',
+      '@opencoven/cli-windows': '0.0.0'
+    }),
+    'pre-intel'
+  );
+  assert.equal(
+    nativePackageSet({
+      '@opencoven/cli-macos': '0.0.0',
+      '@opencoven/cli-macos-x64': '0.0.0',
+      '@opencoven/cli-linux-x64': '0.0.0',
+      '@opencoven/cli-windows': '0.0.0'
+    }),
+    'post-intel'
+  );
+  assert.throws(
+    () => nativePackageSet({ '@opencoven/cli-macos': '0.0.0', '@opencoven/cli-linux-x64': '0.0.0' }),
+    /only supports the complete pre-Intel or post-Intel package sets/
+  );
 });
 
 const SIGNAL_TEST_PACKAGES = {
@@ -200,6 +226,30 @@ test('validatePublishVersion allows real publish with explicit release version',
 
 test('macOS target publishes under human-facing native package name', () => {
   assert.equal(targetPackageName('macos'), '@opencoven/cli-macos');
+});
+
+test('Intel macOS target publishes under its own native package name', () => {
+  assert.equal(targetPackageName('macos-x64'), '@opencoven/cli-macos-x64');
+});
+
+test('native package sets keep historical recovery explicit', () => {
+  assert.deepEqual(nativeTargetNamesForPackageSet('pre-intel'), ['macos', 'linux-x64', 'windows']);
+  assert.deepEqual(nativeTargetNamesForPackageSet('post-intel'), ['macos', 'macos-x64', 'linux-x64', 'windows']);
+  assert.throws(() => nativeTargetNamesForPackageSet('unexpected'), /Unsupported native package set/);
+});
+
+test('release platform matrix omits Intel macOS for pre-Intel recovery', () => {
+  assert.deepEqual(platformMatrix('pre-intel'), {
+    include: [
+      { 'npm-target': 'macos', 'rust-target': 'aarch64-apple-darwin', runner: 'macos-26', binary: 'coven' },
+      { 'npm-target': 'linux-x64', 'rust-target': 'x86_64-unknown-linux-gnu', runner: 'ubuntu-latest', binary: 'coven' },
+      { 'npm-target': 'windows', 'rust-target': 'x86_64-pc-windows-msvc', runner: 'windows-latest', binary: 'coven.exe' }
+    ]
+  });
+  assert.equal(
+    platformMatrix('post-intel').include.some((entry) => entry['npm-target'] === 'macos-x64'),
+    true
+  );
 });
 
 test('linux x64 target publishes under linux native package name', () => {
@@ -426,6 +476,15 @@ test('wrapper binary maps linux x64 to linux native package and documents glibc 
   assert.match(bin, /glibc-based Linux x64/);
 });
 
+test('wrapper binary maps Intel macOS to the Intel native package', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const bin = readFileSync(binPath, 'utf8');
+  assert.match(bin, /'darwin-x64': '@opencoven\/cli-macos-x64'/);
+  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
+  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  assert.equal(packageJson.optionalDependencies['@opencoven/cli-macos-x64'], '0.0.0');
+});
+
 test('wrapper binary maps windows x64 to windows native package and exe binary', () => {
   const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
   const bin = readFileSync(binPath, 'utf8');
@@ -466,8 +525,12 @@ test('release workflow builds and dry-runs linux x64 package', () => {
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /npm-target: linux-x64/);
-  assert.match(workflow, /rust-target: x86_64-unknown-linux-gnu/);
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'linux-x64'/);
+  assert.match(matrixScript, /'rust-target': 'x86_64-unknown-linux-gnu'/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --dry-run --skip-wrapper/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=linux-x64 --skip-build --publish --skip-wrapper/);
 });
@@ -478,10 +541,43 @@ test('release workflow builds macOS package on arm64 runner', () => {
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /npm-target: macos/);
-  assert.match(workflow, /rust-target: aarch64-apple-darwin/);
-  assert.match(workflow, /runner: macos-26/);
-  assert.doesNotMatch(workflow, /runner: macos-latest/);
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'macos'/);
+  assert.match(matrixScript, /'rust-target': 'aarch64-apple-darwin'/);
+  assert.match(matrixScript, /runner: 'macos-26'/);
+  assert.doesNotMatch(matrixScript, /runner: 'macos-latest'/);
+  assert.match(workflow, /matrix: \$\{\{ fromJSON\(needs\.verify-tag\.outputs\.platform_matrix\) \}\}/);
+});
+
+test('release workflow builds and publishes Intel macOS as a separate target', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'macos-x64'/);
+  assert.match(matrixScript, /'rust-target': 'x86_64-apple-darwin'/);
+  assert.match(matrixScript, /runner: 'macos-15-intel'/);
+  assert.match(workflow, /name: coven-\$\{\{ matrix\.npm-target \}\}/);
+  assert.match(workflow, /release-npm-platform-matrix\.mjs/);
+  assert.match(workflow, /cargo build --release --package coven-cli --target \$\{\{ matrix\.rust-target \}\}/);
+  assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --dry-run --skip-wrapper/);
+  assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --publish --skip-wrapper/);
+});
+
+test('CI smoke-tests the Intel macOS wrapper on its native runner', () => {
+  const workflowPath = new URL(['..', '.github', 'workflows', 'ci.yml'].join('/'), import.meta.url);
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /os: macos-15-intel[\s\S]*npm-target: macos-x64[\s\S]*rust-target: x86_64-apple-darwin/);
+  assert.match(workflow, /cargo build --release --package coven-cli --target \$\{\{ matrix\.rust-target \}\}/);
+  assert.match(workflow, /node scripts\/test-cli-prepublish\.mjs --target=\$\{\{ matrix\.npm-target \}\} --skip-build --skip-secrets-scan/);
 });
 
 test('release workflow builds and dry-runs windows package', () => {
@@ -490,10 +586,14 @@ test('release workflow builds and dry-runs windows package', () => {
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /npm-target: windows/);
-  assert.match(workflow, /rust-target: x86_64-pc-windows-msvc/);
-  assert.match(workflow, /runner: windows-latest/);
-  assert.match(workflow, /binary: coven\.exe/);
+  const matrixScript = readFileSync(
+    new URL(['..', 'scripts', 'release-npm-platform-matrix.mjs'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(matrixScript, /'npm-target': 'windows'/);
+  assert.match(matrixScript, /'rust-target': 'x86_64-pc-windows-msvc'/);
+  assert.match(matrixScript, /runner: 'windows-latest'/);
+  assert.match(matrixScript, /binary: 'coven\.exe'/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=windows --skip-build --dry-run --skip-wrapper/);
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=windows --skip-build --publish --skip-wrapper/);
 });
@@ -729,8 +829,8 @@ test('release workflow publishes only missing packages during recovery', () => {
   );
   assert.match(
     publish,
-    /name: Confirm expected partial npm state[\s\S]*@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows[\s\S]*@opencoven\/cli-macos[\s\S]*@opencoven\/cli/,
-    'recovery must prove the exact two-published, two-missing package state'
+    /name: Confirm expected partial npm state[\s\S]*@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows[\s\S]*@opencoven\/cli-macos[\s\S]*@opencoven\/cli-macos-x64[\s\S]*@opencoven\/cli/,
+    'recovery must prove the supported pre-Intel or post-Intel registry state'
   );
   assert.match(
     publish,
@@ -749,8 +849,18 @@ test('release workflow publishes only missing packages during recovery', () => {
   );
   assert.match(
     dryRun,
-    /--target=macos --skip-build --dry-run\s*\n\s*env:/,
-    'macOS plus wrapper dry-run must run in normal and recovery modes'
+    /--target=macos --skip-build --dry-run --skip-wrapper\s*\n\s*env:/,
+    'Apple Silicon macOS dry-run must run in normal and recovery modes'
+  );
+  assert.match(
+    dryRun,
+    /--target=macos-x64 --skip-build --dry-run --skip-wrapper[\s\S]*native_package_set == 'post-intel'/,
+    'Intel macOS dry-run must run for normal and post-Intel recovery releases'
+  );
+  assert.match(
+    dryRun,
+    /--wrapper-only --dry-run[\s\S]*COVEN_NPM_NATIVE_PACKAGE_SET/,
+    'wrapper dry-run must use the verified historical package set'
   );
   assert.match(
     publish,
@@ -764,8 +874,18 @@ test('release workflow publishes only missing packages during recovery', () => {
   );
   assert.match(
     publish,
-    /--target=macos --skip-build --publish\s*\n\s*env:/,
-    'macOS plus wrapper publication must run in normal and recovery modes'
+    /--target=macos --skip-build --publish --skip-wrapper\s*\n\s*env:/,
+    'Apple Silicon macOS publication must run in normal and recovery modes'
+  );
+  assert.match(
+    publish,
+    /--target=macos-x64 --skip-build --publish --skip-wrapper[\s\S]*native_package_set == 'post-intel'/,
+    'Intel macOS publication must run for normal and post-Intel recovery releases'
+  );
+  assert.match(
+    publish,
+    /--wrapper-only --publish[\s\S]*COVEN_NPM_NATIVE_PACKAGE_SET/,
+    'wrapper publication must happen after all selected native packages'
   );
   assert.doesNotMatch(
     workflow,
@@ -830,10 +950,11 @@ test('releasing guide documents signed partial-publish recovery', () => {
 
   assert.match(guide, /vX\.Y\.Z-recovery\.N/);
   assert.match(guide, /new signed recovery tag/i);
-  assert.match(guide, /original release tag is an ancestor/i);
+  assert.match(guide, /original tag to be an ancestor/i);
   assert.match(guide, /never move or reuse/i);
   assert.match(guide, /@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows/);
   assert.match(guide, /@opencoven\/cli-macos[\s\S]*@opencoven\/cli/);
+  assert.match(guide, /@opencoven\/cli-macos-x64/);
   assert.match(guide, /npm trust github/);
 });
 

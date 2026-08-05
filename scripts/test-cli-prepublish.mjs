@@ -5,7 +5,7 @@
 //   1. Verifies prerequisites (node, npm, cargo).
 //   2. Runs the secrets scan, onboarding, PR readiness, and publish guardrails.
 //   3. Stages the dist tree by running publish-npm.mjs in --dry-run mode
-//      (which also runs `cargo build --release --target <rust-target>` unless
+//      (which also runs `cargo build --release --package coven-cli --target <rust-target>` unless
 //      --skip-build is passed) and lets `npm publish --dry-run` validate the
 //      platform + wrapper tarballs.
 //   4. `npm pack`s the native and wrapper packages, installs them into a fresh
@@ -13,14 +13,14 @@
 //      is resolved, executable, and can start the daemon with isolated state.
 //
 // Flags:
-//   --target=<name>       Override the npm target (macos, linux-x64, windows).
+//   --target=<name>       Override the npm target (macos, macos-x64, linux-x64, windows).
 //                         Defaults to the local platform.
 //   --dashboard-tarball=<path>
 //                         Install a locally packed dashboard companion and
 //                         verify `coven memory open --help` through the wrapper.
 //   --skip-build          Reuse an existing release binary at
 //                         target/<rust-target>/release/coven instead of
-//                         re-running `cargo build --release --target ...`.
+//                         re-running `cargo build --release --package coven-cli --target ...`.
 //   --with-cargo-gates    Also run `cargo fmt --check`, `cargo clippy`, and
 //                         `cargo test --workspace --locked` (the CI verify
 //                         gates). Off by default to keep local runs fast.
@@ -48,6 +48,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 
 const PLATFORM_TARGETS = {
   macos: { packageName: '@opencoven/cli-macos', binaryName: 'coven' },
+  'macos-x64': { packageName: '@opencoven/cli-macos-x64', binaryName: 'coven' },
   'linux-x64': { packageName: '@opencoven/cli-linux-x64', binaryName: 'coven' },
   windows: { packageName: '@opencoven/cli-windows', binaryName: 'coven.exe' }
 };
