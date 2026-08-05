@@ -290,7 +290,7 @@ fn health_response_with_hub(
     }
     response.storage = Some(
         store::storage_health(coven_home, event_writer.as_ref()).unwrap_or_else(|error| {
-            store::unavailable_storage_health(error, event_writer.as_ref())
+            store::unavailable_storage_health(coven_home, error, None, event_writer.as_ref())
         }),
     );
     response.event_writer = event_writer;
@@ -6823,6 +6823,39 @@ mod tests {
         assert_eq!(body["eventWriter"]["queuedBytes"], 4096);
         assert_eq!(body["storage"]["writerBacklogEvents"], 3);
         assert_eq!(body["storage"]["writerBacklogBytes"], 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn health_degrades_when_storage_collection_cannot_start() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let parent_file = temp_dir.path().join("not-a-dir");
+        std::fs::write(&parent_file, "marker")?;
+        let missing_home = parent_file.join("missing-home");
+        let response = handle_request_with_runtime(
+            "GET",
+            "/health",
+            &missing_home,
+            None,
+            None,
+            &HealthRuntime,
+        )?;
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(body["storage"]["status"], "degraded");
+        assert!(
+            body["storage"]["freeDiskBytes"].is_u64(),
+            "free-space sampling may be known for the enclosing drive or unknown as zero"
+        );
+        assert_eq!(body["storage"]["maintenanceBlocked"], false);
+        assert_eq!(body["storage"]["writerBacklogEvents"], 3);
+        assert_eq!(body["storage"]["writerBacklogBytes"], 4096);
+        assert!(body.get("eventWriter").is_some());
+        assert!(body["eventWriter"].is_object());
+        assert!(parent_file.is_file());
+        assert!(!missing_home.exists());
+        assert!(!missing_home.join("coven.sqlite3").exists());
         Ok(())
     }
 
