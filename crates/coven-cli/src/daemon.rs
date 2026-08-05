@@ -2157,13 +2157,36 @@ fn start_store_maintenance_scheduler(coven_home: &Path) -> Result<()> {
 
             // The store helper owns the bounded convergence loop so one
             // scheduler tick cannot multiply the configured batch budget.
-            if let Err(error) = crate::store::run_scheduled_maintenance(&home, &now) {
-                let details = format!("store maintenance pass failed: {error:#}");
-                record_store_maintenance_failure(&home, &details);
+            match crate::store::run_scheduled_maintenance(&home, &now) {
+                Ok(report) => refresh_storage_health_after_maintenance(&home, &report),
+                Err(error) => {
+                    let details = format!("store maintenance pass failed: {error:#}");
+                    record_store_maintenance_failure(&home, &details);
+                }
             }
         })
         .context("failed to spawn store maintenance scheduler")?;
     Ok(())
+}
+
+fn refresh_storage_health_after_maintenance(
+    coven_home: &Path,
+    report: &crate::store::ScheduledMaintenanceReport,
+) {
+    if report.blocked_by_free_disk {
+        return;
+    }
+
+    let store_path = coven_home.join("coven.sqlite3");
+    match crate::store::open_initialized_store(&store_path).and_then(|conn| {
+        crate::store::refresh_storage_health_snapshot_from_connection(coven_home, &conn, None)
+    }) {
+        Ok(()) => {}
+        Err(error) => {
+            let details = format!("storage health snapshot refresh failed: {error:#}");
+            record_store_maintenance_failure(coven_home, &details);
+        }
+    }
 }
 
 fn record_store_maintenance_failure(coven_home: &Path, details: &str) {
@@ -2180,6 +2203,17 @@ fn record_store_maintenance_failure_with_free_disk_check(
     free_disk_check: std::io::Result<u64>,
 ) {
     append_daemon_recovery_log(coven_home, details);
+    let known_free_disk_bytes = free_disk_check.as_ref().ok().copied();
+    if let Err(error) = crate::store::mark_storage_health_snapshot_maintenance_failure(
+        coven_home,
+        known_free_disk_bytes,
+        None,
+    ) {
+        append_daemon_recovery_log(
+            coven_home,
+            &format!("failed to mark storage health snapshot degraded: {error:#}"),
+        );
+    }
     match free_disk_check {
         Ok(free_disk_bytes) if free_disk_bytes >= crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES => {
             crate::store::record_maintenance_error(coven_home, details);
@@ -2456,7 +2490,35 @@ pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
 }
 
 fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
-    crate::store::initialize_store(&coven_home.join("coven.sqlite3"))
+    let store_path = coven_home.join("coven.sqlite3");
+    crate::store::initialize_store(&store_path)?;
+    let conn = crate::store::open_initialized_store(&store_path)?;
+    crate::hub::initialize_hub_identity(&conn)
+        .context("failed to initialize hub identity during daemon startup")?;
+    if let Err(error) = crate::hub::refresh_status_snapshot_from_connection(coven_home, &conn) {
+        append_daemon_recovery_log(
+            coven_home,
+            &format!("hub status snapshot refresh failed during daemon startup: {error:#}"),
+        );
+    }
+    if let Err(error) =
+        crate::store::refresh_storage_health_snapshot_from_connection(coven_home, &conn, None)
+    {
+        append_daemon_recovery_log(
+            coven_home,
+            &format!("storage health snapshot refresh failed during daemon startup: {error:#}"),
+        );
+        if let Err(cache_error) = crate::store::cache_unavailable_storage_health(coven_home, None) {
+            append_daemon_recovery_log(
+                coven_home,
+                &format!(
+                    "failed to cache unavailable storage health during daemon startup: \
+                     {cache_error:#}"
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -3132,8 +3194,62 @@ mod tests {
     fn daemon_store_initialization_prepares_request_connections() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         initialize_daemon_store(temp_dir.path())?;
-        let conn = crate::store::open_initialized_store(&temp_dir.path().join("coven.sqlite3"))?;
+        let store_path = temp_dir.path().join("coven.sqlite3");
+        let conn = crate::store::open_initialized_store(&store_path)?;
         assert!(crate::store::list_sessions(&conn)?.is_empty());
+        let hub_id: String = conn.query_row(
+            "SELECT value FROM store_meta WHERE key = ?1",
+            [crate::hub::HUB_ID_META_KEY],
+            |row| row.get(0),
+        )?;
+        assert!(hub_id.starts_with("hub_"));
+
+        initialize_daemon_store(temp_dir.path())?;
+        let health = crate::api::handle_request("GET", "/health", temp_dir.path(), None)?;
+        assert_eq!(health.status, 200);
+        let health: serde_json::Value = serde_json::from_str(&health.body)?;
+        assert_eq!(health["hub"]["hubId"], hub_id);
+        assert_eq!(health["hub"]["nodesTotal"], 0);
+        assert_eq!(health["hub"]["nodesAvailable"], 0);
+
+        let summary = crate::hub::hub_health_summary(temp_dir.path())?;
+        assert_eq!(summary["hubId"], hub_id);
+        assert_eq!(summary["nodesTotal"], 0);
+        assert_eq!(summary["nodesAvailable"], 0);
+
+        let status = crate::hub::hub_status(temp_dir.path())?;
+        assert_eq!(status.status, 200);
+        let status: serde_json::Value = serde_json::from_str(&status.body)?;
+        assert_eq!(status["hubId"], hub_id);
+        assert_eq!(status["nodesTotal"], 0);
+        assert_eq!(status["nodesAvailable"], 0);
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_store_initialization_degrades_health_for_malformed_privacy_config() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::write(
+            temp_dir.path().join("privacy.toml"),
+            "log_retention_days = \"broken\"\n",
+        )?;
+
+        initialize_daemon_store(temp_dir.path())?;
+
+        let health = crate::api::handle_request("GET", "/health", temp_dir.path(), None)?;
+        assert_eq!(health.status, 200);
+        let health: serde_json::Value = serde_json::from_str(&health.body)?;
+        assert_eq!(health["storage"]["status"], "degraded");
+        assert_eq!(
+            health["storage"]["lastMaintenanceError"],
+            "storage health unavailable"
+        );
+        assert!(!health
+            .to_string()
+            .contains(temp_dir.path().to_string_lossy().as_ref()));
+
+        let hub_status = crate::hub::hub_status(temp_dir.path())?;
+        assert_eq!(hub_status.status, 200);
         Ok(())
     }
 
@@ -5656,6 +5772,122 @@ mod tests {
         let log = std::fs::read_to_string(daemon_recovery_log_path(temp_dir.path()))?;
         assert!(log.contains("store maintenance pass failed"));
         assert!(!temp_dir.path().join("coven.sqlite3").exists());
+        let health = crate::store::cached_storage_health_with_free_disk(
+            temp_dir.path(),
+            crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES - 1,
+            None,
+        )?;
+        assert_eq!(health.status, "degraded");
+        assert_eq!(
+            health.free_disk_bytes,
+            crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES - 1
+        );
+        assert_eq!(
+            health.last_maintenance_error.as_deref(),
+            Some("storage health unavailable")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_maintenance_report_skips_store_refresh() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let report = crate::store::ScheduledMaintenanceReport {
+            raw_artifacts_pruned: 0,
+            events_pruned: 0,
+            checkpoint_ran: false,
+            blocked_by_free_disk: true,
+        };
+
+        refresh_storage_health_after_maintenance(temp_dir.path(), &report);
+
+        for file_name in ["coven.sqlite3", "coven.sqlite3-wal", "coven.sqlite3-shm"] {
+            assert!(
+                !temp_dir.path().join(file_name).exists(),
+                "blocked maintenance must not create {file_name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_failure_preserves_last_good_health_until_successful_refresh() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path();
+        let store_path = home.join("coven.sqlite3");
+        let conn = crate::store::open_store(&store_path)?;
+        for (key, value) in [
+            ("maintenance_last_prune_at", "2026-08-05T12:00:00Z"),
+            ("maintenance_last_checkpoint_at", "2026-08-05T12:01:00Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO store_meta(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                rusqlite::params![key, value],
+            )?;
+        }
+        let writer = crate::event_writer::EventWriterHealth {
+            state: "pressured".to_string(),
+            queued_events: 7,
+            queued_bytes: 8192,
+            capacity_bytes: 2 * 1024 * 1024,
+            dropped_output_events: 1,
+            dropped_output_bytes: 512,
+            connection_opens: 1,
+            transactions: 3,
+            committed_events: 12,
+            last_error: None,
+        };
+        crate::store::refresh_storage_health_snapshot_from_connection_with_free_disk(
+            home,
+            &conn,
+            crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES,
+            Some(&writer),
+        )?;
+        let before = crate::store::cached_storage_health_with_free_disk(
+            home,
+            crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES,
+            Some(&writer),
+        )?;
+        drop(conn);
+
+        record_store_maintenance_failure_with_free_disk_check(
+            home,
+            "store maintenance pass failed: failed to read /private/home",
+            Ok(crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES),
+        );
+
+        let degraded = crate::store::cached_storage_health_with_free_disk(
+            home,
+            crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES,
+            None,
+        )?;
+        assert_eq!(degraded.status, "degraded");
+        assert_eq!(degraded.database_bytes, before.database_bytes);
+        assert_eq!(degraded.last_prune_at, before.last_prune_at);
+        assert_eq!(degraded.last_checkpoint_at, before.last_checkpoint_at);
+        assert_eq!(degraded.writer_backlog_events, 7);
+        assert_eq!(degraded.writer_backlog_bytes, 8192);
+        assert_eq!(
+            degraded.last_maintenance_error.as_deref(),
+            Some("maintenance pass failed")
+        );
+
+        crate::store::run_scheduled_maintenance(home, "2026-08-05T12:02:00Z")?;
+        let conn = crate::store::open_initialized_store(&store_path)?;
+        crate::store::refresh_storage_health_snapshot_from_connection_with_free_disk(
+            home,
+            &conn,
+            crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES,
+            None,
+        )?;
+        let recovered = crate::store::cached_storage_health_with_free_disk(
+            home,
+            crate::store::MAINTENANCE_MIN_FREE_DISK_BYTES,
+            None,
+        )?;
+        assert_ne!(recovered.status, "degraded");
+        assert!(recovered.last_maintenance_error.is_none());
         Ok(())
     }
 
