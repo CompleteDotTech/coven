@@ -28,6 +28,9 @@ mod executor_node;
 mod familiar_identity;
 mod handoff;
 mod harness;
+/// Public at the crate root so every adapter entrypoint shares one contract
+/// vocabulary instead of re-declaring embedded runner details.
+pub mod harness_contract;
 mod hub;
 mod maintenance_gate;
 mod memory_dashboard;
