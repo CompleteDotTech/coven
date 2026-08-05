@@ -26,6 +26,7 @@ mod eval_loop;
 mod event_writer;
 mod executor_node;
 mod familiar_identity;
+mod handoff;
 mod harness;
 mod hub;
 mod maintenance_gate;
