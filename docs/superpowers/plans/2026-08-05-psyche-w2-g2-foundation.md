@@ -4,7 +4,7 @@
 
 **Goal:** Finish Psyche W2 and produce terminal G2 evidence for canonical versioned records, durable SQLite migrations, behavior-level fake boundaries, and migration/state-machine/property/crash tests.
 
-**Architecture:** Extend the merged four-crate bootstrap with the focused crates named by the canonical architecture. `psyche-core` owns policy-free identifiers, digests, schema names, and minimum record shapes; `psyche-store` owns SQLite, migrations, immutable records, append-only transitions, quarantine, retention, and its package-local crash helper; `psyche-coven` and `psyche-surfaces` own behavior-level traits for their respective boundaries; `psyche-test-support` owns deterministic scripted fakes and reusable conformance fixtures. `psyche-runtime` remains the only composition root. W3-W9 retain identity resolution, graph admission, orchestration policy, real Coven integration, Telegram behavior, verification, and add-on trust.
+**Architecture:** Extend the merged four-crate bootstrap with the focused crates named by the canonical architecture. `psyche-core` owns policy-free identifiers, digests, schema names, and minimum record shapes; `psyche-store` owns SQLite, migrations, immutable records, append-only execution-binding revisions and transitions, quarantine, retention, and its package-local crash helper; `psyche-coven` and `psyche-surfaces` own behavior-level traits for their respective boundaries; `psyche-test-support` owns deterministic scripted fakes and reusable conformance fixtures. `psyche-runtime` remains the only composition root. W3-W9 retain identity resolution, graph admission, orchestration policy, real Coven integration, Telegram behavior, verification, and add-on trust.
 
 **Tech Stack:** Rust 2024 on 1.85, serde/serde_json, RFC 8785 JSON canonicalization, SHA-256, ULID, rusqlite with bundled SQLite, Tokio, proptest, tempfile, assert_cmd, cargo-deny, gitleaks.
 
@@ -21,7 +21,7 @@ branch.
 | Stable schema identifiers and strict decoding | Identity-file resolution and principal mapping (W3) |
 | Minimum typed records frozen by W0 | Graph admission, dependency-cycle policy, budgets, and orchestration (W4) |
 | Canonical JSON and content digests | Real Coven endpoints, adoption, cancellation, and artifacts (W5/G4) |
-| SQLite migrations, immutable records, append-only transitions | Telegram normalization, routing, effects, and delivery (W6/G8) |
+| SQLite migrations, immutable records, append-only execution-binding revisions and transitions | Telegram normalization, routing, effects, and delivery (W6/G8) |
 | Quarantine, retention, reopen, and crash atomicity | Verdict policy and independent verification (W7/G5) |
 | Behavior-level ports and deterministic fakes | Production child dispatch (W8/G6) |
 | Reusable fake conformance fixtures | Add-on trust and execution (W9/G7) |
@@ -59,6 +59,8 @@ passes. It does not set any G4-G12 capability.
 
 ### New `psyche-store` files
 
+- `crates/psyche-store/src/execution_bindings.rs` - append-only,
+  digest-linked execution-binding revision ledger.
 - `crates/psyche-store/src/transitions.rs` - store-owned, validated
   `Transition` wire type and append-only persistence.
 
@@ -93,6 +95,8 @@ impl Store {
     pub fn schema_version(&self) -> Result<u32, StoreError>;
     pub fn ingest(&mut self, bytes: &[u8]) -> Result<IngestOutcome, StoreError>;
     pub fn insert(&mut self, document: &CanonicalDocument) -> Result<(), StoreError>;
+    pub fn execution_binding_revisions(&self, attempt_id: &RecordId)
+        -> Result<Vec<ExecutionBinding>, StoreError>;
     pub fn append_transition(&mut self, transition: &Transition) -> Result<(), StoreError>;
     pub fn load(&self, kind: SchemaKind, id: &RecordId)
         -> Result<Option<CanonicalDocument>, StoreError>;
@@ -160,22 +164,24 @@ Every item below has a named automated test:
 4. Record digests exclude no mutable field: changing any serialized field changes the digest.
 5. Typed direct inserts run the same schema and field-kind validation as decoded inserts.
 6. Immutable records reject same-ID/different-digest reinsertion.
-7. Transition rows validate their complete digest-bearing shape and append atomically; no API updates or deletes historical rows.
-8. Raw rejected payloads are not written to logs or error messages.
-9. Quarantine retains bounded bytes and a digest, not an unbounded diagnostic echo.
-10. SQLite enables foreign keys, WAL, secure delete, and a busy timeout on every connection.
-11. Unknown database schema versions fail before migrations or application reads.
-12. A crash before commit exposes no partial record or transition after reopen.
-13. Automated retention never deletes transition history, audit events, or unresolved quarantine.
-14. Fake services never advertise behavior that their script cannot execute.
-15. No fake result is described as current real-Coven conformance.
-16. Delivery keeps the canonical `del_` prefix; delegation cannot claim it.
-17. Quarantine resolution is validated, durable, idempotent, and conflict-safe.
-18. Checkpoint failure still publishes `Stopped`, wakes every waiter, and returns the preserved error.
-19. Every canonical v1 error code decodes strictly; unknown codes quarantine rather than aliasing a known code.
-20. Ambiguous Coven adoption is durably returned or fenced through the reconciliation operation; faults never authorize redispatch.
-21. Adoption request digests are recomputed from every canonical typed request field; callers cannot reuse a digest for changed work.
-22. Cancellation completion requires typed O5 acknowledgement evidence; raw `killed`, `orphaned`, or other ledger status never suffices.
+7. Execution-binding revisions are immutable, monotonically versioned, and
+   digest-linked; the store appends them without overwriting prior state.
+8. Transition rows validate their complete digest-bearing shape and append atomically; no API updates or deletes historical rows.
+9. Raw rejected payloads are not written to logs or error messages.
+10. Quarantine retains bounded bytes and a digest, not an unbounded diagnostic echo.
+11. SQLite enables foreign keys, WAL, secure delete, and a busy timeout on every connection.
+12. Unknown database schema versions fail before migrations or application reads.
+13. A crash before commit exposes no partial record, binding revision, or transition after reopen.
+14. Automated retention never deletes execution-binding revisions, transition history, audit events, or unresolved quarantine.
+15. Fake services never advertise behavior that their script cannot execute.
+16. No fake result is described as current real-Coven conformance.
+17. Delivery keeps the canonical `del_` prefix; delegation cannot claim it.
+18. Quarantine resolution is validated, durable, idempotent, and conflict-safe.
+19. Checkpoint failure still publishes `Stopped`, wakes every waiter, and returns the preserved error.
+20. Every canonical v1 error code decodes strictly; unknown codes quarantine rather than aliasing a known code.
+21. Ambiguous Coven adoption is durably returned or fenced through the reconciliation operation; faults never authorize redispatch.
+22. Adoption request digests are recomputed from every canonical typed request field; callers cannot reuse a digest for changed work.
+23. Cancellation completion requires typed O5 acknowledgement evidence; raw `killed`, `orphaned`, or other ledger status never suffices.
 
 ## Gate mapping
 
@@ -857,6 +863,16 @@ pub struct CancellationUnresolvedEvidence {
     #[serde(with = "time::serde::rfc3339")]
     pub recorded_at: time::OffsetDateTime,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "TerminationRequestCorrelationWire")]
+pub struct TerminationRequestCorrelation {
+    pub termination_request_id: RequestId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub valid_until: time::OffsetDateTime,
+}
 ```
 
 `NotRequested` and `TerminationRequested` carry no terminal evidence.
@@ -878,44 +894,110 @@ kinds, and raw-ledger promotion. Add `ExecutionBinding` with the exact fields
 required by the W0 TECH description. Name the focused integration test
 `cancellation_state_vocabulary_requires_matching_o5_evidence`.
 
-`CancellationAcknowledgementEvidence`,
-`CancellationAcknowledgementKind`, and `CancellationUnresolvedEvidence` are
+`CancellationAcknowledgementEvidence`, `CancellationAcknowledgementKind`,
+`CancellationUnresolvedEvidence`, and `TerminationRequestCorrelation` are
 owned by `psyche-core/src/contracts/execution.rs` and re-exported by
-`psyche-core`; they do not import `psyche-coven`. `ExecutionBinding` contains:
+`psyche-core`; they do not import `psyche-coven`. `ExecutionBinding` contains
+the complete correlation required to validate a direct store insertion:
 
 ```rust
-pub cancellation_state: CancellationState,
-pub cancellation_acknowledgement: Option<CancellationAcknowledgementEvidence>,
-pub cancellation_unresolved: Option<CancellationUnresolvedEvidence>,
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExecutionBinding {
+    pub schema_version: SchemaVersion,
+    pub attempt_id: RecordId,
+    pub revision: u64,
+    pub previous_revision_digest: Option<Sha256Digest>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub revision_created_at: time::OffsetDateTime,
+    pub familiar_snapshot_id: RecordId,
+    pub project_id: String,
+    pub request_id: RequestId,
+    pub request_digest: Sha256Digest,
+    #[serde(with = "time::serde::rfc3339")]
+    pub request_created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub request_valid_until: time::OffsetDateTime,
+    pub coven_contract_version: String,
+    pub coven_session_id: Option<String>,
+    pub adoption_state: AdoptionState,
+    pub event_cursor: Option<String>,
+    pub cancellation_state: CancellationState,
+    pub termination_request: Option<TerminationRequestCorrelation>,
+    pub termination_reason_code: Option<String>,
+    pub cancellation_acknowledgement: Option<CancellationAcknowledgementEvidence>,
+    pub cancellation_unresolved: Option<CancellationUnresolvedEvidence>,
+    pub terminal_state: Option<String>,
+}
 ```
 
-Validation enforces an exact one-of matrix: both evidence fields are absent for
-`NotRequested`/`TerminationRequested`; acknowledgement alone is present with
-the matching kind for either acknowledged state; unresolved alone is present
-for `TerminationUnknown`. Every evidence reference must match the binding's
-session ID, execution request ID/digest, and termination request ID, use
+The canonical W0 field names remain `request_id` and `request_digest`.
+The private `ExecutionBindingWire` mirrors these fields, denies unknown fields,
+and reaches the public type only through `TryFrom` validation; the public struct
+does not derive an unchecked `Deserialize`.
+`request_created_at`, `request_valid_until`, `termination_request`, and
+`termination_reason_code` are the additive G2 fields needed to make the frozen
+correlation and cancellation invariants locally enforceable. `event_cursor` remains an opaque validated
+string; Psyche does not assume a numeric real-Coven cursor before W5.
+`revision`, `previous_revision_digest`, and `revision_created_at` make state
+changes append-only: revision 1 has no previous digest; every later revision
+names the canonical digest of its immediate predecessor.
+
+Validation first requires
+`revision >= 1`, `previous_revision_digest.is_none()` exactly when
+`revision == 1`, an RFC 3339 UTC `revision_created_at`, and
+`request_valid_until > request_created_at`. It then
+enforces an exact matrix:
+
+- `NotRequested`: termination correlation, termination reason, and both
+  evidence fields are absent;
+- `TerminationRequested`: a termination correlation and reason are present and
+  both evidence fields are absent;
+- either acknowledged state: the termination correlation and matching
+  reason/acknowledgement alone are present;
+- `TerminationUnknown`: the termination correlation and unresolved evidence
+  plus the frozen termination reason alone are present.
+
+The termination correlation requires
+`valid_until > created_at >= request_created_at`; its
+`termination_request_id` must differ from the execution request ID. The
+`termination_reason_code` is the authoritative request reason, uses the same
+1..=128-byte lowercase ASCII reason-code grammar as unresolved evidence, and is
+frozen with the termination ID/window in every later revision. The
+termination window is independent of the execution-adoption deadline, so a
+long-running adopted session can be cancelled after
+`request_valid_until`; cancellation evidence is bounded by
+`termination_request.valid_until`, not the earlier adoption deadline.
+
+Every evidence reference must match the binding's session ID, execution request
+ID/digest, and authoritative `termination_request.termination_request_id`, use
 1..=255-byte UTF-8 acknowledgement/disposition/session IDs and a 1..=128-byte
 lowercase ASCII reason code, and carry a valid SHA-256 authority digest and
-RFC 3339 timestamp. The acknowledgement/unresolved timestamp cannot precede
-the binding/request creation time or exceed its validity window. The
-termination request ID must differ from the execution request ID. Constructors
-validate these rules; serde uses `TryFrom` validation rather than deriving an
-unchecked public wire path. This makes direct
-`CanonicalDocument::ExecutionBinding` inserts enforceable entirely in
-core/store without a reverse dependency.
+RFC 3339 timestamp. The acknowledgement or unresolved timestamp must fall in
+the closed interval from `termination_request.created_at` through
+`termination_request.valid_until`. Constructors validate these rules; serde
+uses `TryFrom` validation rather than deriving an unchecked public wire path.
+This makes direct `CanonicalDocument::ExecutionBinding` inserts enforceable
+entirely in core/store without a reverse dependency.
 
 The store tests mutate each evidence field independently: absent evidence,
 wrong kind, acknowledgement plus unresolved evidence, wrong session,
 termination/execution request ID or digest, reused request ID, invalid
-authority digest, empty/oversized ID or reason, and timestamps before creation
-or after lifetime. Every case must return
+authority digest, empty/oversized ID or reason, a missing or mismatched
+termination correlation, absent/unexpected/invalid termination reason, and
+timestamps before termination creation or after its deadline. Every case must return
 `ContractError::CancellationEvidenceMismatch` before a row or transition is
 written.
 
-The two private `*Wire` structs mirror the public fields and use
+The three private `*Wire` structs mirror their public fields and use
 `#[serde(deny_unknown_fields)]`; their `TryFrom` implementations call the same
-constructors/validators. They are module-private implementation details, so no
-unchecked evidence struct crosses the `psyche-core` boundary.
+constructors/validators. They prevent deserialization from bypassing
+validation. The public evidence and correlation fields remain directly
+constructible so store tests can perform one-field mutation checks, so callers
+must not treat construction alone as proof of validity:
+`CanonicalDocument::validate()` revalidates every `ExecutionBinding` before
+persistence, and the private-field `TerminationRequest` below can be created
+only by the persist-then-invoke coordinator after the exact session-bound
+revision commits.
 
 Define the surface-neutral contracts in `contracts/surface.rs` with these exact
 owned wire fields:
@@ -1474,6 +1556,24 @@ CREATE TABLE canonical_records (
   PRIMARY KEY (kind, record_id),
   UNIQUE (kind, record_id, digest)
 ) STRICT;
+CREATE TABLE execution_binding_revisions (
+  attempt_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  schema_version TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  previous_revision_digest TEXT,
+  canonical_json BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (attempt_id, revision),
+  UNIQUE (attempt_id, digest),
+  CHECK (
+    (revision = 1 AND previous_revision_digest IS NULL)
+    OR
+    (revision > 1 AND previous_revision_digest IS NOT NULL)
+  ),
+  FOREIGN KEY (attempt_id, previous_revision_digest)
+    REFERENCES execution_binding_revisions(attempt_id, digest)
+) STRICT;
 CREATE TABLE transitions (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,
@@ -1512,7 +1612,10 @@ CREATE TABLE audit_events (
 
 The generic tables are the W2 storage substrate, not a replacement for the
 domain indexes listed in `TECH.md`. W3-W9 add indexed projections in their own
-forward-only migrations.
+forward-only migrations. `canonical_records` stores records whose identity is
+immutable. `execution_binding_revisions` is the one G2 append-only revision
+ledger required because adoption, cursor, cancellation, and terminal
+correlation evolve while the attempt identity remains fixed.
 
 - [ ] **Step 4: Configure every connection**
 
@@ -1561,10 +1664,11 @@ git commit -m "feat(store): add forward-only foundation migration"
 
 ---
 
-### Task 6: Persist immutable records and append-only transitions
+### Task 6: Persist immutable records, binding revisions, and transitions
 
 **Files:**
 - Create: `crates/psyche-store/src/records.rs`
+- Create: `crates/psyche-store/src/execution_bindings.rs`
 - Create: `crates/psyche-store/src/transitions.rs`
 - Create: `crates/psyche-store/tests/records.rs`
 - Modify: `crates/psyche-store/src/lib.rs`
@@ -1681,14 +1785,27 @@ fn direct_insert_rejects_non_persistable_error_envelope() {
 #[test]
 fn direct_insert_rejects_acknowledged_cancellation_without_evidence() {
     let (mut store, _dir) = test_store();
-    let mut binding = fixture_execution_binding();
-    binding.cancellation_state = CancellationState::AcknowledgedTerminated;
+    let mut binding = fixture_acknowledged_execution_binding();
     binding.cancellation_acknowledgement = None;
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_rejects_acknowledged_state_without_termination_correlation() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    binding.termination_request = None;
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
 }
 
 #[test]
@@ -1700,11 +1817,556 @@ fn direct_insert_rejects_mismatched_cancellation_evidence() {
         .as_mut()
         .unwrap()
         .execution_request_digest = fixture_other_digest();
+    let attempt_id = binding.attempt_id.clone();
     assert!(matches!(
         store.insert(&CanonicalDocument::ExecutionBinding(binding)),
         Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
     ));
-    assert_eq!(store.total_record_count().unwrap(), 0);
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_rejects_wrong_termination_request_id() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    binding
+        .cancellation_acknowledgement
+        .as_mut()
+        .unwrap()
+        .termination_request_id = fixture_other_request_id();
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_rejects_termination_before_execution_request() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    let before_execution = binding.request_created_at - time::Duration::nanoseconds(1);
+    binding
+        .termination_request
+        .as_mut()
+        .unwrap()
+        .created_at = before_execution;
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_rejects_acknowledgement_outside_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    let after_deadline = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .valid_until
+        + time::Duration::nanoseconds(1);
+    binding
+        .cancellation_acknowledgement
+        .as_mut()
+        .unwrap()
+        .acknowledged_at = after_deadline;
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_rejects_acknowledgement_before_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    let before_start = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .created_at
+        - time::Duration::nanoseconds(1);
+    binding
+        .cancellation_acknowledgement
+        .as_mut()
+        .unwrap()
+        .acknowledged_at = before_start;
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_rejects_unresolved_outside_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_unresolved_execution_binding();
+    let after_deadline = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .valid_until
+        + time::Duration::nanoseconds(1);
+    binding
+        .cancellation_unresolved
+        .as_mut()
+        .unwrap()
+        .recorded_at = after_deadline;
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_rejects_unresolved_before_termination_window() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_unresolved_execution_binding();
+    let before_start = binding
+        .termination_request
+        .as_ref()
+        .unwrap()
+        .created_at
+        - time::Duration::nanoseconds(1);
+    binding
+        .cancellation_unresolved
+        .as_mut()
+        .unwrap()
+        .recorded_at = before_start;
+    let attempt_id = binding.attempt_id.clone();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(binding)),
+        Err(StoreError::Contract(ContractError::CancellationEvidenceMismatch { .. }))
+    ));
+    assert!(store.execution_binding_revisions(&attempt_id).unwrap().is_empty());
+}
+
+#[test]
+fn direct_insert_accepts_acknowledgement_at_termination_window_boundaries() {
+    for use_deadline in [false, true] {
+        let (mut store, _dir) = test_store();
+        let mut binding = fixture_acknowledged_execution_binding();
+        let termination = binding.termination_request.as_ref().unwrap();
+        let evidence_time = if use_deadline {
+            termination.valid_until
+        } else {
+            termination.created_at
+        };
+        binding
+            .cancellation_acknowledgement
+            .as_mut()
+            .unwrap()
+            .acknowledged_at = evidence_time;
+        let attempt_id = binding.attempt_id.clone();
+        store
+            .insert(&CanonicalDocument::ExecutionBinding(binding))
+            .unwrap();
+        assert_eq!(store.execution_binding_revisions(&attempt_id).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn direct_insert_accepts_unresolved_at_termination_window_boundaries() {
+    for use_deadline in [false, true] {
+        let (mut store, _dir) = test_store();
+        let mut binding = fixture_unresolved_execution_binding();
+        let termination = binding.termination_request.as_ref().unwrap();
+        let evidence_time = if use_deadline {
+            termination.valid_until
+        } else {
+            termination.created_at
+        };
+        binding
+            .cancellation_unresolved
+            .as_mut()
+            .unwrap()
+            .recorded_at = evidence_time;
+        let attempt_id = binding.attempt_id.clone();
+        store
+            .insert(&CanonicalDocument::ExecutionBinding(binding))
+            .unwrap();
+        assert_eq!(store.execution_binding_revisions(&attempt_id).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn direct_insert_accepts_termination_window_after_execution_deadline() {
+    let (mut store, _dir) = test_store();
+    let binding = fixture_acknowledged_binding_after_execution_deadline();
+    assert!(
+        binding.termination_request.as_ref().unwrap().created_at
+            > binding.request_valid_until
+    );
+    let attempt_id = binding.attempt_id.clone();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(binding))
+        .unwrap();
+    assert_eq!(store.execution_binding_revisions(&attempt_id).unwrap().len(), 1);
+}
+
+#[test]
+fn direct_insert_accepts_termination_at_execution_creation_boundary() {
+    let (mut store, _dir) = test_store();
+    let mut binding = fixture_acknowledged_execution_binding();
+    let execution_created_at = binding.request_created_at;
+    binding
+        .termination_request
+        .as_mut()
+        .unwrap()
+        .created_at = execution_created_at;
+    let attempt_id = binding.attempt_id.clone();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(binding))
+        .unwrap();
+    assert_eq!(store.execution_binding_revisions(&attempt_id).unwrap().len(), 1);
+}
+
+#[test]
+fn execution_binding_revision_appends_termination_outcomes_without_record_conflict() {
+    let (mut acknowledged_store, _acknowledged_dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    acknowledged_store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    let requested = fixture_termination_requested_revision(&initial);
+    acknowledged_store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let acknowledged = fixture_acknowledged_revision(&requested);
+    acknowledged_store
+        .insert(&CanonicalDocument::ExecutionBinding(acknowledged.clone()))
+        .unwrap();
+    assert_eq!(
+        acknowledged_store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested, acknowledged]
+    );
+
+    let (mut unresolved_store, _unresolved_dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    unresolved_store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    let requested = fixture_termination_requested_revision(&initial);
+    unresolved_store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let unresolved = fixture_unresolved_revision(&requested);
+    unresolved_store
+        .insert(&CanonicalDocument::ExecutionBinding(unresolved.clone()))
+        .unwrap();
+    assert_eq!(
+        unresolved_store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested, unresolved]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_forks_gaps_and_changed_correlation() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+
+    let mut gap = fixture_termination_requested_revision(&initial);
+    gap.revision = 3;
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(gap)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+
+    let mut wrong_previous = fixture_termination_requested_revision(&initial);
+    wrong_previous.previous_revision_digest = Some(fixture_other_digest());
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(wrong_previous)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+
+    let mut changed_correlation = fixture_termination_requested_revision(&initial);
+    changed_correlation.request_digest = fixture_other_digest();
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(changed_correlation)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial]
+    );
+}
+
+#[test]
+fn execution_binding_revision_replay_is_idempotent() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    let requested = fixture_termination_requested_revision(&initial);
+    for revision in [&initial, &requested] {
+        store
+            .insert(&CanonicalDocument::ExecutionBinding((*revision).clone()))
+            .unwrap();
+    }
+    for revision in [&initial, &requested] {
+        store
+            .insert(&CanonicalDocument::ExecutionBinding((*revision).clone()))
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_same_revision_changed_bytes() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    let requested = fixture_termination_requested_revision(&initial);
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    for revision in [&initial, &requested] {
+        let mut changed = (*revision).clone();
+        changed.event_cursor = Some("cursor:changed".to_owned());
+        assert!(matches!(
+            store.insert(&CanonicalDocument::ExecutionBinding(changed)),
+            Err(StoreError::ExecutionBindingRevisionConflict { .. })
+        ));
+    }
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_changed_reason_replay() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    let requested = fixture_termination_requested_revision(&initial);
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let mut changed_reason = requested.clone();
+    changed_reason.termination_reason_code = Some("different_reason".to_owned());
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(changed_reason)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested]
+    );
+}
+
+fn assert_next_revision_conflict(mutate: impl FnOnce(&mut ExecutionBinding)) {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    let mut candidate = fixture_next_not_requested_revision(&initial);
+    mutate(&mut candidate);
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(candidate)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_every_frozen_execution_field_change() {
+    assert_next_revision_conflict(|revision| {
+        revision.attempt_id = fixture_other_attempt_id()
+    });
+    assert_next_revision_conflict(|revision| {
+        revision.familiar_snapshot_id = fixture_other_snapshot_id()
+    });
+    assert_next_revision_conflict(|revision| {
+        revision.project_id = fixture_other_project_id()
+    });
+    assert_next_revision_conflict(|revision| {
+        revision.request_id = fixture_other_request_id()
+    });
+    assert_next_revision_conflict(|revision| {
+        revision.request_digest = fixture_other_digest()
+    });
+    assert_next_revision_conflict(|revision| {
+        revision.request_created_at += time::Duration::nanoseconds(1)
+    });
+    assert_next_revision_conflict(|revision| {
+        revision.request_valid_until += time::Duration::nanoseconds(1)
+    });
+    assert_next_revision_conflict(|revision| {
+        revision.coven_contract_version = fixture_other_coven_contract_version()
+    });
+}
+
+#[test]
+fn execution_binding_revision_rejects_session_and_termination_rebinding() {
+    let (mut session_store, _session_dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    let bound = fixture_session_bound_revision(&initial, "session-a");
+    session_store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    session_store
+        .insert(&CanonicalDocument::ExecutionBinding(bound.clone()))
+        .unwrap();
+    let rebound = fixture_session_bound_revision(&bound, "session-b");
+    assert!(matches!(
+        session_store.insert(&CanonicalDocument::ExecutionBinding(rebound)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    let mut cleared = fixture_next_not_requested_revision(&bound);
+    cleared.coven_session_id = None;
+    assert!(matches!(
+        session_store.insert(&CanonicalDocument::ExecutionBinding(cleared)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    assert_eq!(
+        session_store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, bound]
+    );
+
+    let (mut termination_store, _termination_dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    let requested = fixture_termination_requested_revision(&initial);
+    termination_store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    termination_store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let mut changed_id = fixture_next_termination_requested_revision(&requested);
+    changed_id
+        .termination_request
+        .as_mut()
+        .unwrap()
+        .termination_request_id = fixture_other_request_id();
+    assert!(matches!(
+        termination_store.insert(&CanonicalDocument::ExecutionBinding(changed_id)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    let mut changed_created_at = fixture_next_termination_requested_revision(&requested);
+    let termination = changed_created_at
+        .termination_request
+        .as_mut()
+        .unwrap();
+    termination.created_at =
+        termination.created_at + time::Duration::nanoseconds(1);
+    assert!(matches!(
+        termination_store.insert(&CanonicalDocument::ExecutionBinding(changed_created_at)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    let mut changed_valid_until = fixture_next_termination_requested_revision(&requested);
+    let termination = changed_valid_until
+        .termination_request
+        .as_mut()
+        .unwrap();
+    termination.valid_until =
+        termination.valid_until + time::Duration::nanoseconds(1);
+    assert!(matches!(
+        termination_store.insert(&CanonicalDocument::ExecutionBinding(changed_valid_until)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    let mut changed_reason = fixture_next_termination_requested_revision(&requested);
+    changed_reason.termination_reason_code = Some("different_reason".to_owned());
+    assert!(matches!(
+        termination_store.insert(&CanonicalDocument::ExecutionBinding(changed_reason)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    assert_eq!(
+        termination_store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_termination_correlation_removal() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    let requested = fixture_termination_requested_revision(&initial);
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(requested.clone()))
+        .unwrap();
+    let cleared = fixture_not_requested_revision_after(&requested);
+    assert!(matches!(
+        store.insert(&CanonicalDocument::ExecutionBinding(cleared)),
+        Err(StoreError::ExecutionBindingRevisionConflict { .. })
+    ));
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial, requested]
+    );
+}
+
+#[test]
+fn execution_binding_revision_rejects_timestamp_regression() {
+    let (mut store, _dir) = test_store();
+    let initial = fixture_execution_binding_revision_1();
+    store
+        .insert(&CanonicalDocument::ExecutionBinding(initial.clone()))
+        .unwrap();
+    for non_increasing in [
+        initial.revision_created_at,
+        initial.revision_created_at - time::Duration::nanoseconds(1),
+    ] {
+        let mut regressed = fixture_termination_requested_revision(&initial);
+        regressed.revision_created_at = non_increasing;
+        assert!(matches!(
+            store.insert(&CanonicalDocument::ExecutionBinding(regressed)),
+            Err(StoreError::ExecutionBindingRevisionConflict { .. })
+        ));
+    }
+    assert_eq!(
+        store
+            .execution_binding_revisions(&initial.attempt_id)
+            .unwrap(),
+        vec![initial]
+    );
 }
 
 #[test]
@@ -1762,6 +2424,37 @@ the complete Task 3 evidence mutation list, not only the digest example shown
 above. It also covers acknowledged states carrying unresolved evidence and
 `TerminationUnknown` carrying acknowledgement evidence.
 
+`fixture_execution_binding`, `fixture_acknowledged_execution_binding`, and
+`fixture_unresolved_execution_binding` each construct a fully valid binding.
+The latter two include `termination_request: Some(...)` whose ID matches their
+evidence, `termination_reason_code: Some(...)`, and a window containing the
+baseline evidence timestamp. Every negative test mutates exactly one field from
+that valid baseline, so a generic missing-correlation or missing-reason failure
+cannot satisfy a mismatch or window test.
+The revision helpers derive each next revision from its predecessor, increment
+`revision`, set `previous_revision_digest` from the predecessor's canonical
+bytes, and advance `revision_created_at`. They never rebuild the immutable
+execution correlation independently.
+`assert_next_revision_conflict` opens a fresh store, inserts one valid revision
+1, derives a valid revision 2, applies exactly the supplied one-field mutation,
+requires `ExecutionBindingRevisionConflict`, and proves the ledger still
+contains only revision 1. `fixture_session_bound_revision` permits only
+the first `None`-to-value binding and otherwise derives a valid next revision.
+`fixture_next_termination_requested_revision` preserves a valid
+`TerminationRequested` snapshot and advances only the revision metadata. Its
+four conflict cases independently mutate the termination request ID,
+`created_at`, `valid_until`, and reason code; `fixture_other_request_id()`
+differs from both the execution and original termination IDs, the
+one-nanosecond time mutations stay within an intrinsically valid termination
+lifetime, and `different_reason` satisfies the reason grammar. Core validation
+therefore passes and the frozen ledger correlation—not an unrelated evidence
+mismatch—rejects each case.
+`fixture_not_requested_revision_after` derives a valid next revision whose
+`NotRequested` state requires clearing the termination correlation, reason, and
+both evidence fields. This is the minimum structurally valid removal candidate;
+the ledger must reject it because previously established termination authority
+can never disappear.
+
 - [ ] **Step 2: Run and verify RED**
 
 ```bash
@@ -1779,9 +2472,9 @@ hashing, opening a transaction, or executing SQL. It then requires
 `persistable_record_id()`; `CanonicalDocument::Error` returns
 `StoreError::NonPersistableKind { kind: SchemaKind::Error }` and writes
 nothing. `ingest` returns the same explicit error for a recognized error
-envelope rather than quarantining it. For persistable records, `insert`
-canonicalizes and digests the typed document inside the method. Use `INSERT ...
-ON CONFLICT DO NOTHING`, then load the existing digest:
+envelope rather than quarantining it. For persistable records other than `ExecutionBinding`, `insert` canonicalizes
+and digests the typed document inside the method. Use `INSERT ... ON CONFLICT DO
+NOTHING`, then load the existing digest:
 
 Add `StoreError::Contract(ContractError)` for validation failures and
 `StoreError::NonPersistableKind { kind: SchemaKind }` for recognized boundary
@@ -1791,9 +2484,33 @@ envelopes that have no storage identity.
 - different digest: return `StoreError::RecordConflict`;
 - never update canonical bytes.
 
+For `CanonicalDocument::ExecutionBinding`, `insert` routes to the
+`execution_binding_revisions` ledger in one immediate transaction:
+
+- with no prior revision, require revision 1 and no previous digest;
+- otherwise require `revision == latest.revision + 1` and
+  `previous_revision_digest == digest(latest canonical bytes)`;
+- require `revision_created_at > latest.revision_created_at`;
+- require attempt ID, familiar snapshot, project, request ID/digest,
+  request creation/deadline, and Coven contract version to equal revision 1;
+- allow `coven_session_id` to change only from `None` to one non-empty value,
+  then freeze it;
+- once a termination correlation is present, require its exact ID, time
+  window, and reason code in every later revision;
+- reject a reused `(attempt_id, revision)` with changed bytes, a skipped
+  revision, a forked previous digest, or changed immutable correlation as
+  `StoreError::ExecutionBindingRevisionConflict`;
+- accept exact replay of an existing revision idempotently;
+- append canonical bytes and never update or delete a prior revision.
+
+This is storage-shape enforcement, not W4/W5 transition policy. The store does
+not decide which adoption or cancellation state may follow another; it proves
+only linear history, stable authority bindings, and immutable evidence.
+
 `load` and `load_canonical_bytes` likewise reject `SchemaKind::Error` with
 `StoreError::NonPersistableKind` before querying because the envelope has no
-record ID.
+record ID. For `SchemaKind::ExecutionBinding` they return the latest revision;
+`execution_binding_revisions` returns the complete ordered history.
 
 `ingest` is the byte boundary: it calls `decode_document`, invokes `insert` for
 known records, and invokes `quarantine` for unknown kinds, unknown majors, or
@@ -1845,7 +2562,7 @@ Expected: all tests pass with no ignored cases.
 
 ```bash
 git add crates/psyche-store
-git commit -m "feat(store): enforce immutable records and transitions"
+git commit -m "feat(store): enforce immutable records and revisions"
 ```
 
 ---
@@ -1926,9 +2643,14 @@ fn unknown_enum_is_quarantined_without_dispatchable_record() {
 fn quarantine_resolution_is_durable_and_idempotent() {
     let (mut store, dir) = test_store();
     let id = quarantined_fixture(&mut store);
+    let discovered_at = store
+        .quarantine_record(&id)
+        .unwrap()
+        .unwrap()
+        .discovered_at;
     let resolution = resolution(
         QuarantineResolutionCode::ConfirmedInvalid,
-        "2026-08-05T00:01:00Z",
+        discovered_at + time::Duration::seconds(1),
     );
     let first = store.resolve_quarantine(&id, &resolution).unwrap();
     let ResolveQuarantineOutcome::Resolved { resolution_digest } = first else {
@@ -1952,40 +2674,62 @@ fn quarantine_resolution_is_durable_and_idempotent() {
 fn quarantine_resolution_rejects_unknown_stale_or_conflicting_requests() {
     let (mut store, _dir) = test_store();
     let unknown = fixture_quarantine_id();
+    let unknown_resolution = resolution(
+        QuarantineResolutionCode::ConfirmedInvalid,
+        time::OffsetDateTime::UNIX_EPOCH,
+    );
     assert!(matches!(
-        store.resolve_quarantine(&unknown, &valid_resolution()),
+        store.resolve_quarantine(&unknown, &unknown_resolution),
         Err(StoreError::QuarantineNotFound { .. })
     ));
 
     let id = quarantined_fixture(&mut store);
+    let discovered_at = store
+        .quarantine_record(&id)
+        .unwrap()
+        .unwrap()
+        .discovered_at;
     assert!(matches!(
         store.resolve_quarantine(&id, &resolution(
             QuarantineResolutionCode::ConfirmedInvalid,
-            "2026-08-04T23:59:00Z",
+            discovered_at - time::Duration::nanoseconds(1),
         )),
         Err(StoreError::InvalidQuarantineResolution { .. })
     ));
 
-    store.resolve_quarantine(&id, &valid_resolution()).unwrap();
+    store.resolve_quarantine(&id, &resolution(
+        QuarantineResolutionCode::ConfirmedInvalid,
+        discovered_at + time::Duration::seconds(1),
+    )).unwrap();
     assert!(matches!(
         store.resolve_quarantine(&id, &resolution(
             QuarantineResolutionCode::DuplicatePayload,
-            "2026-08-05T00:02:00Z",
+            discovered_at + time::Duration::seconds(2),
         )),
         Err(StoreError::QuarantineResolutionConflict { .. })
     ));
 }
 
 #[test]
-fn pruning_preserves_unresolved_quarantine_and_all_transition_history() {
+fn pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions() {
     let (mut store, _dir) = old_fixture_store();
+    let bindings_before = store
+        .execution_binding_revisions(&fixture_attempt_id())
+        .unwrap();
     let transitions_before = store.transitions(&fixture_graph_id()).unwrap();
     let audit_before = store.audit_events().unwrap();
     let report = store.prune(time::OffsetDateTime::now_utc()).unwrap();
     assert!(report.resolved_quarantine_deleted > 0);
     assert_eq!(report.unresolved_quarantine_deleted, 0);
+    assert_eq!(report.execution_binding_revisions_deleted, 0);
     assert_eq!(report.transitions_deleted, 0);
     assert_eq!(report.audit_events_deleted, 0);
+    assert_eq!(
+        store
+            .execution_binding_revisions(&fixture_attempt_id())
+            .unwrap(),
+        bindings_before
+    );
     assert_eq!(store.transitions(&fixture_graph_id()).unwrap(), transitions_before);
     assert_eq!(store.audit_events().unwrap(), audit_before);
 }
@@ -2034,6 +2778,9 @@ second update or audit event. Any different resolution returns
 `StoreError::QuarantineResolutionConflict` and preserves the first resolution.
 Concurrent resolvers use the same compare-and-set plus reload rule, so exactly
 one resolution wins. Resolution never deletes or redispatches payload bytes.
+The `resolution` test helper accepts an `OffsetDateTime`; positive tests derive
+it from the persisted `discovered_at` (or an injected deterministic clock) and
+never use a wall-clock-stale literal.
 All resolution errors are stable and redacted; they may include the typed
 quarantine ID and resolution digest, but never bounded payload bytes.
 `old_fixture_store()` must create resolved rows through
@@ -2047,16 +2794,19 @@ tests exercise the all-or-none resolution columns and digest.
 - quarantine rows whose `resolved_at` is older than the cutoff and whose
   `resolution_code` and `resolution_digest` are both present.
 
-Transition history is excluded from automated retention. `prune` executes no
-`DELETE` against `transitions`, and `PruneReport::transitions_deleted` is always
-zero. Audit events are also excluded because W2 stores public details as opaque
+Execution-binding revision and transition history are excluded from automated
+retention. `prune` executes no `DELETE` against
+`execution_binding_revisions` or `transitions`, and the corresponding
+`PruneReport` counts are always zero. Audit events are also excluded because W2
+stores public details as opaque
 JSON and defines no indexed reference projection capable of proving that a
 correlation is resolved. `prune` executes no `DELETE` against `audit_events`,
 and `PruneReport::audit_events_deleted` is always zero. A later workstream may
 add an explicit indexed reference table in a forward-only migration before
 automating audit deletion; parsing opaque JSON is never a retention authority.
-Any future transition or audit deletion requires that separately reviewed
-projection/export contract and explicit evidence; it is not part of W2/G2.
+Any future binding-revision, transition, or audit deletion requires that
+separately reviewed projection/export contract and explicit evidence; it is
+not part of W2/G2.
 Return counts in `PruneReport`; do not vacuum automatically.
 
 - [ ] **Step 6: Run retention tests**
@@ -2219,7 +2969,8 @@ impl AdoptionRequest {
     pub fn recompute_digest(&self) -> Result<Sha256Digest, PortError>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "ExecutionCorrelationWire")]
 pub struct ExecutionCorrelation {
     pub request_id: RequestId,
     pub request_digest: Sha256Digest,
@@ -2228,7 +2979,9 @@ pub struct ExecutionCorrelation {
     pub graph_id: RecordId,
     pub node_id: RecordId,
     pub attempt_id: RecordId,
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
     pub valid_until: time::OffsetDateTime,
 }
 
@@ -2314,12 +3067,69 @@ pub struct ArtifactReference {
     pub content: ContentAddressedReference,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminationRequest {
-    pub request_id: RequestId,
-    pub session_id: String,
-    pub correlation: ExecutionCorrelation,
-    pub reason_code: String,
-    pub requested_at: time::OffsetDateTime,
+    persisted_binding: ExecutionBinding,
+    reason_code: String,
+}
+
+impl TerminationRequest {
+    fn from_persisted_binding(
+        persisted_binding: ExecutionBinding,
+    ) -> Result<Self, ContractError> {
+        let reason_code = validate_persisted_termination_binding(&persisted_binding)?;
+        Ok(Self {
+            persisted_binding,
+            reason_code,
+        })
+    }
+
+    pub fn binding(&self) -> &ExecutionBinding { &self.persisted_binding }
+    pub fn reason_code(&self) -> &str { &self.reason_code }
+}
+
+pub trait TerminationPersistence {
+    type Error;
+
+    /// Returns only after the exact revision is durable and its digest-linked
+    /// predecessor was already bound to the same non-empty session.
+    fn persist_requested(
+        &mut self,
+        requested: ExecutionBinding,
+    ) -> Result<Vec<u8>, Self::Error>;
+}
+
+pub enum TerminationDispatchError<E> {
+    Contract(ContractError),
+    Persistence(E),
+    PersistedBindingMismatch,
+    Port(PortError),
+}
+
+pub async fn persist_then_terminate<S, P>(
+    persistence: &mut S,
+    port: &P,
+    requested: ExecutionBinding,
+) -> Result<TerminationDisposition, TerminationDispatchError<S::Error>>
+where
+    S: TerminationPersistence,
+    P: CovenPort + ?Sized,
+{
+    validate_termination_requested_candidate(&requested)
+        .map_err(TerminationDispatchError::Contract)?;
+    let expected_bytes = canonical_bytes(&requested)
+        .map_err(TerminationDispatchError::Contract)?;
+    let persisted_bytes = persistence
+        .persist_requested(requested.clone())
+        .map_err(TerminationDispatchError::Persistence)?;
+    if persisted_bytes != expected_bytes {
+        return Err(TerminationDispatchError::PersistedBindingMismatch);
+    }
+    let request = TerminationRequest::from_persisted_binding(requested)
+        .map_err(TerminationDispatchError::Contract)?;
+    port.terminate(request)
+        .await
+        .map_err(TerminationDispatchError::Port)
 }
 
 pub enum TerminationDisposition {
@@ -2379,6 +3189,10 @@ JSON contains RFC 3339 strings exactly as required by TECH, never the default
 `OffsetDateTime` tuple/object representation. If a later compatible field is
 nullable, it must use `time::serde::rfc3339::option`; nullable timestamps may
 not silently switch encodings.
+`ExecutionCorrelation` also deserializes through a private strict wire form
+whose `TryFrom` checks all field-specific IDs, the request digest, bounded
+project ID, and `valid_until > created_at`; nested result/artifact decoding
+therefore cannot bypass correlation validation.
 `SessionSnapshot`, `ResultBundle`, and every
 `ArtifactReference` must echo the exact adoption correlation. Result and
 artifact expiry may shorten but never extend `correlation.valid_until`; an
@@ -2406,31 +3220,107 @@ and no artifact expiry after `result.expires_at` or
 with `size_bytes` equal to the canonical empty representation's byte length;
 zero is never an “unknown size” sentinel.
 
-The three private `*Wire` forms mirror their public fields and deny unknown
-fields. Their `TryFrom` implementations recursively validate the content
-reference, full correlation, session/artifact association, uniqueness, bounds,
-and lifetime before returning any public typed value.
+The four private `*Wire` forms mirror their public fields and deny unknown
+fields. Their `TryFrom` implementations recursively validate the execution
+correlation, content reference, session/artifact association, uniqueness,
+bounds, and lifetime before returning any public typed value.
+
+`persist_then_terminate` is the only public construction path to
+`TerminationRequest`: all request fields and
+`TerminationRequest::from_persisted_binding` are private, the type has no
+unchecked serde implementation or mutation API, and its getters are read-only.
+The public coordinator first rejects anything other than a valid revision 2+
+`TerminationRequested` binding with one frozen non-empty `coven_session_id`,
+validates the persisted `termination_reason_code` plus termination ID/lifetime,
+and requires the termination ID to differ from the execution request ID and
+`termination.created_at >= request_created_at`. It then calls
+`TerminationPersistence::persist_requested`; that trait's success contract is
+to require the digest-linked predecessor already carry the same non-empty
+session and to return only after the exact candidate revision has committed
+durably. The return value is the committed RFC 8785 canonical byte vector, not a
+parsed `ExecutionBinding`; the coordinator compares it byte-for-byte with
+`canonical_bytes(&requested)`, so equal Rust values with distinct timestamp
+offset spellings cannot satisfy the proof and the attestation necessarily binds
+the termination reason. Mismatched returned bytes fail closed. Only after that
+success does the private constructor derive its read-only reason from the
+validated requested binding and permit
+`CovenPort::terminate`.
+
+The W2 real-store test wrapper implements `TerminationPersistence` by calling
+`execution_binding_revisions` to load the candidate's exact digest-linked
+predecessor, rejecting an absent session or any session mismatch, then calling
+`Store::insert`. It computes the candidate's canonical bytes before insertion
+and returns that byte vector only after `insert` has either committed those
+exact bytes or proved an exact idempotent replay; every `StoreError` propagates.
+The predecessor digest makes a concurrent intervening revision fail as a
+fork/gap rather than turning the precheck into a TOCTOU bypass. It never returns
+a success-shaped fallback. This preserves the dependency direction
+`psyche-coven -> psyche-core`: the boundary defines the narrow persistence
+behavior, while `psyche-test-support` owns the local real-store wrapper for G2
+proof and the later W5 composition root owns the production wrapper. Every
+wrapper must run the same conformance assertion. First-time session binding in
+the termination revision, session rebind, unknown attempt/revision, write
+failure, or persisted-byte mismatch returns before the port call. Because the
+trait accepts only the construction-closed request,
+individual adapters do not become the validation authority. The adapter accepts
+acknowledgement or unresolved evidence only when its termination request ID and
+timestamp match that persisted correlation. It then derives the next revision
+from the termination-requested revision, preserving its digest link and
+immutable execution correlation. It never derives a deadline from response
+arrival time.
+
+Name the table-driven public-coordinator test
+`termination_dispatch_rejects_invalid_request_before_persistence`; it accepts a
+valid request at exact execution-creation equality and a valid late-termination
+request, then independently rejects an empty/oversized session,
+empty/oversized or non-lowercase reason, reused execution request ID, reversed
+termination lifetime, termination creation before execution creation, revision
+1, and any cancellation state other than `TerminationRequested`. Every rejected
+case records zero persistence and zero port calls.
+
+Name the real-store/fake-port ordering test
+`termination_dispatch_requires_durable_session_bound_revision`. Its successful
+case seeds a session-bound revision 1, calls the public coordinator with the
+derived revision 2, and makes `FakeCoven::terminate` reopen the SQLite file and
+assert that the exact `TerminationRequested` revision is already durable before
+recording its call. Its negative cases independently use a changed session, a
+termination revision that attempts to bind a previously absent session, a
+revision 2 for an unknown attempt, injected persistence failure, and a
+persistence implementation returning different bytes for a structurally equal
+timestamp instant; every case requires zero port calls and no new binding
+revision. The reusable assertion is part of the fake/real conformance contract
+that W5 must run unchanged.
 
 Add a strict canonical `tests/fixtures/result-bundle.json` containing one
 primary `application/json` result and one `text/plain` artifact. In
 `tests/bindings.rs`, name the positive test
-`result_bundle_fixture_round_trips_complete_content_references`. Add negative
-tests for missing/unknown result fields, wrong result digest/media type/size,
-zero or oversized size, malformed media type, result expiry beyond correlation
-lifetime, duplicate artifact ID, artifact session/correlation mismatch, and
-artifact digest/media type/size/expiry disagreement. Collect the constructor,
-payload, bounds, and expiry cases in the exact test
+`result_bundle_fixture_round_trips_complete_content_references`. Add
+`result_bundle_fixture_uses_launch_request_correlation`, which loads
+`execution-request-launch.json`, constructs `AdoptionRequest` through its
+public constructor, and asserts its derived correlation equals the bundle and
+artifact correlations. Add negative tests for missing/unknown result fields,
+wrong result digest/media type/size, zero or oversized size, malformed media
+type, result expiry beyond correlation lifetime, duplicate artifact ID,
+artifact session/correlation mismatch, and artifact digest/media type/size/
+expiry disagreement. Collect the constructor, payload, bounds, and expiry
+cases in the exact test
 `content_reference_rejects_digest_size_media_type_and_lifetime_mismatch`.
 
 The fixture's exact decoded values are:
 
 ```json
-{"session_id":"session-1","correlation":{"execution_request_id":"req_01J00000000000000000000000","request_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","familiar_snapshot":"ids_01J00000000000000000000000","project_id":"project:sha256:abc","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","attempt_id":"att_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"result":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","media_type":"application/json","size_bytes":2,"expires_at":"2026-08-05T14:04:00Z"},"artifacts":[{"artifact_id":"artifact-1","session_id":"session-1","correlation":{"execution_request_id":"req_01J00000000000000000000000","request_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","familiar_snapshot":"ids_01J00000000000000000000000","project_id":"project:sha256:abc","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","attempt_id":"att_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"content":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","media_type":"text/plain","size_bytes":5,"expires_at":"2026-08-05T14:03:00Z"}}]}
+{"artifacts":[{"artifact_id":"artifact-1","content":{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","expires_at":"2026-08-05T14:03:00Z","media_type":"text/plain","size_bytes":5},"correlation":{"attempt_id":"att_01J00000000000000000000000","created_at":"2026-08-05T14:00:00Z","familiar_snapshot_id":"ids_01J00000000000000000000000","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","project_id":"project:sha256:abc","request_digest":"sha256:75d651c5eb7f6e3ccd65631fce08afdcb8ac2a800bc0d8db55eaf9cf43519d04","request_id":"req_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"session_id":"session-1"}],"correlation":{"attempt_id":"att_01J00000000000000000000000","created_at":"2026-08-05T14:00:00Z","familiar_snapshot_id":"ids_01J00000000000000000000000","graph_id":"grf_01J00000000000000000000000","node_id":"nod_01J00000000000000000000000","project_id":"project:sha256:abc","request_digest":"sha256:75d651c5eb7f6e3ccd65631fce08afdcb8ac2a800bc0d8db55eaf9cf43519d04","request_id":"req_01J00000000000000000000000","valid_until":"2026-08-05T14:05:00Z"},"result":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","expires_at":"2026-08-05T14:04:00Z","media_type":"application/json","size_bytes":2},"session_id":"session-1"}
 ```
 
 The physical fixture is this single RFC 8785-canonical line with no trailing
 newline; the test parses it, validates it, and requires reserialization to
 produce identical bytes.
+The fixture correlation must equal
+`AdoptionRequest::new(decoded_launch_golden).correlation()` field-for-field;
+the fixture test does not independently construct or overwrite it. In
+particular, `request_digest` is the launch golden digest
+`sha256:75d651c5eb7f6e3ccd65631fce08afdcb8ac2a800bc0d8db55eaf9cf43519d04`,
+and both `created_at` and `valid_until` come from the same launch request.
 
 The fake's durable result ledger retains the complete result/artifact
 references through the greater of their expiry, the graph recovery window, and
@@ -2506,8 +3396,8 @@ The core-owned `CancellationAcknowledgementEvidence` is the separate O5
 authority evidence required by C-S9. `psyche-coven` imports it from
 `psyche-core`; it does not define a parallel acknowledgement type.
 The adapter maps the O5 response into the canonical evidence only after exact
-session/request/correlation/digest validation, then persists the resulting
-`ExecutionBinding`. An unresolved O5 response maps to the core-owned
+session/request/correlation/digest validation, then appends the resulting
+`ExecutionBinding` revision. An unresolved O5 response maps to the core-owned
 `CancellationUnresolvedEvidence`. This dependency remains
 `psyche-coven -> psyche-core`; core/store never depend on the adapter.
 
@@ -2515,11 +3405,12 @@ Acknowledgement evidence is not derived from `SessionSnapshot::terminal_state`,
 `CovenEvent::terminal_state`, process exit, disconnect, or a raw persisted
 session status. `Acknowledged` validates a non-empty opaque acknowledgement ID,
 the exact termination request/session/execution correlation, a non-zero
-authority-evidence digest, and an acknowledgement timestamp no earlier than
-the request. `AlreadyAuthoritativelyTerminal` still requires this O5 evidence;
-reading a terminal ledger string is insufficient. `Unresolved` is durable,
-correlation-bound, restart-stable, and maps only to Psyche
-`termination_unknown`.
+authority-evidence digest, and an acknowledgement timestamp within the
+persisted termination correlation's inclusive creation/deadline window.
+`AlreadyAuthoritativelyTerminal` still requires this O5 evidence; reading a
+terminal ledger string is insufficient. `Unresolved` is durable,
+correlation-bound, restart-stable, subject to the same termination window, and
+maps only to Psyche `termination_unknown`.
 
 The C-S9 suite must feed every raw O1 ledger status (`created`, `running`,
 `idle`, `completed`, `failed`, `killed`, and `orphaned`) through snapshots and
@@ -2656,17 +3547,20 @@ Expected: compile failure because `FoundationOperation` and its model are absent
 - [ ] **Step 3: Implement a policy-free reference model**
 
 Define generated operations for insert, identical reinsert, conflicting
-reinsert, invalid direct insert (schema or field-ID kind), append-next-transition,
-append-duplicate-version, invalid transition digest/kind, quarantine,
-resolve-quarantine, prune, checkpoint, and reopen. The reference model tracks
-only durable keys, digests, transition versions, and quarantine resolution.
-Every invalid direct insert and invalid transition leaves the model and store
-unchanged.
+reinsert, invalid direct insert (schema or field-ID kind), append-next-binding-
+revision, replay-binding-revision, fork/gap/correlation-mismatch binding
+revision, append-next-transition, append-duplicate-version, invalid transition
+digest/kind, quarantine, resolve-quarantine, prune, checkpoint, and reopen. The
+reference model tracks durable keys, immutable-record digests, binding revision
+numbers/digest links, frozen session and termination ID/window/reason,
+transition versions, and quarantine resolution. Every
+invalid direct insert, binding revision, and transition leaves the model and
+store unchanged.
 Generated `resolve-quarantine` operations call the public
 `Store::resolve_quarantine` API and model first resolution, identical replay,
 unknown ID, stale timestamp, and conflicting replay outcomes explicitly.
-Prune never removes transition versions or audit events from either model or
-store.
+Prune never removes execution-binding revisions, transition versions, or audit
+events from either model or store.
 It must not encode graph/node transition legality, admission, delegation,
 budget, verification, delivery, or recovery policy.
 
@@ -2903,7 +3797,9 @@ content size, malformed media type, result expiry beyond the
 correlation lifetime, artifact expiry beyond either result or correlation
 lifetime, duplicate artifact IDs, `artifact.content` disagreement, and
 artifacts omitted from the complete result association. It round-trips the
-strict `result-bundle.json` fixture before running each independent mutation.
+strict `result-bundle.json` fixture, proves its correlation is exactly
+`AdoptionRequest::correlation()` for the launch golden, then runs each
+independent mutation.
 
 `assert_c_s6_ambiguity_fence` must:
 
@@ -3042,6 +3938,7 @@ Expected: failure because `crash_writer` is absent.
 
 - `exit-before-commit`;
 - `exit-after-record-before-transition`;
+- `exit-after-binding-revision-before-commit`;
 - `exit-after-commit-before-checkpoint`;
 - `exit-during-migration`.
 
@@ -3082,10 +3979,13 @@ can fire. Production transaction code has no callback or selectable seam.
 
 The other modes open a real store, write the committed baseline, begin the
 named operation, then call `std::process::abort()` at the declared point. The
-helper is a `psyche-store` binary target, so `cargo_bin!("crash_writer")` in
-the `psyche-store` integration test resolves within the package Cargo is
-testing. Default builds do not compile the feature-gated module or binary, and
-the public production `Store` API contains no fault selector or test hook.
+binding-revision mode begins the same immediate transaction used by the
+production ledger, inserts the next canonical revision, and aborts before
+commit; reopen must expose only the predecessor. The helper is a `psyche-store`
+binary target, so `cargo_bin!("crash_writer")` in the `psyche-store`
+integration test resolves within the package Cargo is testing. Default builds
+do not compile the feature-gated module or binary, and the public production
+`Store` API contains no fault selector or test hook.
 
 - [ ] **Step 4: Add reopen assertions**
 
@@ -3094,8 +3994,10 @@ For every crash point, prove:
 - SQLite integrity check returns `ok`;
 - only committed rows are visible;
 - migration version is either wholly old or wholly new;
-- no same-ID/different-digest record exists;
-- quarantine and complete transition-history invariants hold;
+- no same-ID/different-digest immutable record or same-attempt/same-revision
+  binding conflict exists;
+- quarantine, complete execution-binding revision history, and complete
+  transition-history invariants hold;
 - reopening twice is idempotent.
 
 - [ ] **Step 5: Run crash and migration suites repeatedly**
@@ -3397,7 +4299,9 @@ Use this complete manifest shape:
       "list_command": "cargo test -p psyche-coven --test bindings -- --list --format terse",
       "tests": [
         "result_bundle_fixture_round_trips_complete_content_references",
-        "content_reference_rejects_digest_size_media_type_and_lifetime_mismatch"
+        "result_bundle_fixture_uses_launch_request_correlation",
+        "content_reference_rejects_digest_size_media_type_and_lifetime_mismatch",
+        "termination_dispatch_rejects_invalid_request_before_persistence"
       ]
     },
     "psyche-store/records": {
@@ -3406,7 +4310,27 @@ Use this complete manifest shape:
         "delivery_direct_insert_round_trips_canonically",
         "direct_insert_rejects_wrong_field_id_kind_without_writing",
         "direct_insert_rejects_acknowledged_cancellation_without_evidence",
+        "direct_insert_rejects_acknowledged_state_without_termination_correlation",
         "direct_insert_rejects_mismatched_cancellation_evidence",
+        "direct_insert_rejects_wrong_termination_request_id",
+        "direct_insert_rejects_termination_before_execution_request",
+        "direct_insert_rejects_acknowledgement_outside_termination_window",
+        "direct_insert_rejects_acknowledgement_before_termination_window",
+        "direct_insert_rejects_unresolved_outside_termination_window",
+        "direct_insert_rejects_unresolved_before_termination_window",
+        "direct_insert_accepts_acknowledgement_at_termination_window_boundaries",
+        "direct_insert_accepts_unresolved_at_termination_window_boundaries",
+        "direct_insert_accepts_termination_window_after_execution_deadline",
+        "direct_insert_accepts_termination_at_execution_creation_boundary",
+        "execution_binding_revision_appends_termination_outcomes_without_record_conflict",
+        "execution_binding_revision_rejects_forks_gaps_and_changed_correlation",
+        "execution_binding_revision_replay_is_idempotent",
+        "execution_binding_revision_rejects_same_revision_changed_bytes",
+        "execution_binding_revision_rejects_changed_reason_replay",
+        "execution_binding_revision_rejects_every_frozen_execution_field_change",
+        "execution_binding_revision_rejects_session_and_termination_rebinding",
+        "execution_binding_revision_rejects_termination_correlation_removal",
+        "execution_binding_revision_rejects_timestamp_regression",
         "transition_versions_are_monotonic_and_append_only"
       ]
     },
@@ -3415,7 +4339,9 @@ Use this complete manifest shape:
       "tests": [
         "quarantine_id_constructor_parser_and_serde_round_trip",
         "unknown_enum_is_quarantined_without_dispatchable_record",
-        "quarantine_resolution_is_durable_and_idempotent"
+        "quarantine_resolution_is_durable_and_idempotent",
+        "concurrent_quarantine_resolution_has_one_durable_winner",
+        "pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions"
       ]
     },
     "psyche-store/migrations": {
@@ -3432,7 +4358,10 @@ Use this complete manifest shape:
     },
     "psyche-test-support/fakes": {
       "list_command": "cargo test -p psyche-test-support --test fakes -- --list --format terse",
-      "tests": ["advertised_adoption_requires_a_scripted_adoption_step"]
+      "tests": [
+        "advertised_adoption_requires_a_scripted_adoption_step",
+        "termination_dispatch_requires_durable_session_bound_revision"
+      ]
     },
     "psyche-test-support/state_machine": {
       "list_command": "cargo test -p psyche-test-support --test state_machine -- --list --format terse",
@@ -3577,15 +4506,17 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Package-local nullable-binding fixtures | `cargo test -p psyche-core --test contracts -- --exact graph_and_node_accept_only_the_two_frozen_nullable_bindings` | not run remotely | none |
 | Exhaustive registered decode | `cargo test -p psyche-core --test decode -- --exact recognized_error_envelope_decodes_exhaustively` | not run remotely | none |
 | Unknown kind/version/enum denial and quarantine | `cargo test -p psyche-core --test decode -- --exact unknown_typed_enum_is_a_quarantinable_decode_failure && cargo test -p psyche-store --test retention -- --exact unknown_enum_is_quarantined_without_dispatchable_record` | not run remotely | none |
-| Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent` | not run remotely | none |
-| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence` | not run remotely | none |
+| Quarantine resolution | `cargo test -p psyche-store --test retention -- --exact quarantine_resolution_is_durable_and_idempotent && cargo test -p psyche-store --test retention -- --exact concurrent_quarantine_resolution_has_one_durable_winner` | not run remotely | none |
+| Direct typed insert validation | `cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_field_id_kind_without_writing && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_cancellation_without_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledged_state_without_termination_correlation && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_mismatched_cancellation_evidence && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_wrong_termination_request_id && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_termination_before_execution_request && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_acknowledgement_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_outside_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_rejects_unresolved_before_termination_window && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_acknowledgement_at_termination_window_boundaries && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_unresolved_at_termination_window_boundaries && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_termination_window_after_execution_deadline && cargo test -p psyche-store --test records -- --exact direct_insert_accepts_termination_at_execution_creation_boundary` | not run remotely | none |
+| Append-only execution-binding revisions | `cargo test -p psyche-store --test records -- --exact execution_binding_revision_appends_termination_outcomes_without_record_conflict && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_forks_gaps_and_changed_correlation && cargo test -p psyche-store --test records -- --exact execution_binding_revision_replay_is_idempotent && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_same_revision_changed_bytes && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_changed_reason_replay && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_every_frozen_execution_field_change && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_session_and_termination_rebinding && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_termination_correlation_removal && cargo test -p psyche-store --test records -- --exact execution_binding_revision_rejects_timestamp_regression && cargo test -p psyche-store --test retention -- --exact pruning_preserves_unresolved_quarantine_binding_revisions_and_transitions` | not run remotely | none |
 | Transition contract and append-only rules | `cargo test -p psyche-store --test records -- --exact transition_versions_are_monotonic_and_append_only` | not run remotely | none |
 | Checkpoint-failure shutdown | `cargo test -p psyche-runtime --lib -- --exact tests::checkpoint_failure_stops_and_releases_every_shutdown_waiter` | not run remotely | none |
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
 | State-machine/property | `cargo test -p psyche-test-support --test state_machine -- --exact model_and_store_agree_after_any_foundation_operation_sequence` | not run remotely | none |
 | Crash/restart | `cargo test -p psyche-store --features test-fault-injection --test crash -- --exact killed_writer_exposes_only_committed_state_after_reopen` | not run remotely | none |
-| Fake boundaries | `cargo test -p psyche-test-support --test fakes -- --exact advertised_adoption_requires_a_scripted_adoption_step` | not run remotely | none |
+| Fake boundaries and durable termination ordering | `cargo test -p psyche-test-support --test fakes -- --exact advertised_adoption_requires_a_scripted_adoption_step && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_requires_durable_session_bound_revision` | not run remotely | none |
 | Execution request RFC3339 golden bytes | `cargo test -p psyche-coven --test request_digest -- --exact execution_request_launch_matches_golden_bytes_and_digest && cargo test -p psyche-coven --test request_digest -- --exact execution_request_input_matches_golden_bytes_and_digest` | not run remotely | none |
+| Validated termination dispatch | `cargo test -p psyche-coven --test bindings -- --exact termination_dispatch_rejects_invalid_request_before_persistence` | not run remotely | none |
 | G2 cancellation-state vocabulary | `cargo test -p psyche-core --test contracts -- --exact cancellation_state_vocabulary_requires_matching_o5_evidence` | not run remotely | none |
 | Full execution-request digest binding | `cargo test -p psyche-test-support --test state_machine -- --exact request_digest_binds_every_typed_field` | not run remotely | none |
 | C-S1 scripted contract negotiation | `cargo test -p psyche-test-support --test conformance -- --exact c_s1_contract_negotiation` | not run remotely | none |
@@ -3597,7 +4528,7 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | C-S7 scripted ordered cursor | `cargo test -p psyche-test-support --test conformance -- --exact c_s7_ordered_cursor` | not run remotely | none |
 | C-S8 scripted terminal authority | `cargo test -p psyche-test-support --test conformance -- --exact c_s8_terminal_authority` | not run remotely | none |
 | C-S9 scripted O5 cancellation acknowledgement | `cargo test -p psyche-test-support --test conformance -- --exact c_s9_cancellation_acknowledgement` | not run remotely | none |
-| C-S10 scripted result/artifact binding | `cargo test -p psyche-coven --test bindings -- --exact result_bundle_fixture_round_trips_complete_content_references && cargo test -p psyche-coven --test bindings -- --exact content_reference_rejects_digest_size_media_type_and_lifetime_mismatch && cargo test -p psyche-test-support --test conformance -- --exact c_s10_result_artifact_binding` | not run remotely | none |
+| C-S10 scripted result/artifact binding | `cargo test -p psyche-coven --test bindings -- --exact result_bundle_fixture_round_trips_complete_content_references && cargo test -p psyche-coven --test bindings -- --exact result_bundle_fixture_uses_launch_request_correlation && cargo test -p psyche-coven --test bindings -- --exact content_reference_rejects_digest_size_media_type_and_lifetime_mismatch && cargo test -p psyche-test-support --test conformance -- --exact c_s10_result_artifact_binding` | not run remotely | none |
 | C-S11 scripted restart persistence | `cargo test -p psyche-test-support --test conformance -- --exact c_s11_restart_persistence` | not run remotely | none |
 | C-S12 scripted structured denial | `cargo test -p psyche-test-support --test conformance -- --exact c_s12_structured_denial` | not run remotely | none |
 ```
@@ -3797,21 +4728,22 @@ The implementation is ready for G2 review only when:
 5. every persisted typed record is validated on both decode and direct insert;
 6. every unknown kind, major, or typed enum value becomes a bounded quarantine record;
 7. quarantine resolution is durable, idempotent, conflict-safe, and the only route that makes a row retention-eligible;
-8. same-ID/different-digest insertion fails without mutation;
-9. the store-owned `Transition` validates kind/ID/version/state/digest/time, appends monotonically, and has no update/delete API;
-10. automated retention excludes transition history and audit events;
-11. migrations and crash recovery are atomic, and unknown-future versions fail closed;
-12. clean or failed checkpointing publishes `Stopped`, wakes all shutdown callers, and returns one deterministic terminal outcome through `Runtime::state()`;
-13. C-S6 uses the executable correlation-bound reconciliation operation, persists return/fence dispositions across restart and faults, and proves no redispatch while unresolved or returned;
-14. adoption IDs/digests bind the full canonical launch/input request, are recomputed by both owners, and reject every changed field before mutation;
-15. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; direct inserts reject absent/mismatched evidence, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
-16. execution-request timestamps serialize as RFC 3339 strings and both golden canonical byte/digest fixtures match exactly;
-17. `CancellationState` uses the complete G2-owned local vocabulary and never claims nonexistent TECH or current Coven O5 authority;
-18. every fixture include path resolves from its Rust source and the nullable-binding fixtures exist at the declared package-local paths;
-19. fake and real-adapter fixtures expose the same adapter-neutral availability/fault/reset/observation controls, and reusable suites have no fake-only relaxed assertions;
-20. every C-S1 through C-S12 reusable function has an exact executable wrapper, manifest entry, and evidence row; expected-unsupported diagnostics cannot be counted as passed;
-21. passed evidence contains exact executable commands, `passed` results, one verified immutable run URL, immutable Coven plan/spec URLs and SHA-256 values, and no candidate placeholders;
-22. the C-S10 result and every artifact carry validated digest, media type, size, expiry, and full correlation, with strict fixture, mismatch, and retention-owner tests;
-23. every filtered evidence command uses an exact manifest-listed test that Cargo `--list` proves exists, so zero-match success is rejected;
-24. `RecordKind::Attempt` and `att_` are the sole execution-binding identity kind/prefix; there is no duplicate binding-named record-kind variant and every exhaustive mapping/test agrees;
-25. full local and remote gates pass for the attested source SHA, every later commit through the reviewed evidence head changes only `docs/G2-EVIDENCE.md`, and no W3-W9 policy or G4+ capability is enabled.
+8. same-ID/different-digest immutable-record insertion and same-attempt/same-revision binding conflicts fail without mutation;
+9. execution-binding state changes append as strictly time-increasing, monotonically numbered, previous-digest-linked immutable revisions; exact replay of the latest or any historical revision is idempotent, while latest or historical same-revision changed bytes—including a changed termination reason—gaps, forks, every frozen execution-field change, session clearing/rebinding, each independent termination-ID/window/reason rebind, and termination-authority removal fail without mutation; a termination-requested revision can be followed by either authoritative acknowledgement or unresolved evidence without `RecordConflict`, overwrite, or history loss;
+10. the store-owned `Transition` validates kind/ID/version/state/digest/time, appends monotonically, and has no update/delete API;
+11. automated retention excludes execution-binding revision history, transition history, and audit events;
+12. migrations and crash recovery are atomic, and unknown-future versions fail closed;
+13. clean or failed checkpointing publishes `Stopped`, wakes all shutdown callers, and returns one deterministic terminal outcome through `Runtime::state()`;
+14. C-S6 uses the executable correlation-bound reconciliation operation, persists return/fence dispositions across restart and faults, and proves no redispatch while unresolved or returned;
+15. adoption IDs/digests bind the full canonical launch/input request, are recomputed by both owners, and reject every changed field before mutation;
+16. C-S9 accepts only core-owned, fully correlated durable typed O5 acknowledgement evidence; `TerminationRequest` is construction-closed and can reach the trait only through a conformance-tested persist-then-invoke coordinator accepting both concrete and `dyn CovenPort` fixtures; the execution-binding revision ledger requires an already session-bound digest-linked predecessor and commits the exact authoritative termination request ID, window, and reason before the port call, with the persistence proof compared as RFC 8785 canonical bytes rather than structural equality; it appends the response evidence afterward, accepts termination creation equal to execution creation, both closed evidence-window endpoints, and post-adoption-deadline termination, rejects unpersisted attempts, first-time session binding, session rebinding, changed-reason replay, persistence failure, returned-byte mismatch, and absent/mismatched/out-of-window evidence without a port call, and every raw ledger status, including `killed` and `orphaned`, remains insufficient;
+17. execution-request timestamps serialize as RFC 3339 strings and both golden canonical byte/digest fixtures match exactly;
+18. `CancellationState` uses the complete G2-owned local vocabulary and never claims nonexistent TECH or current Coven O5 authority;
+19. every fixture include path resolves from its Rust source and the nullable-binding fixtures exist at the declared package-local paths;
+20. fake and real-adapter fixtures expose the same adapter-neutral availability/fault/reset/observation controls, and reusable suites have no fake-only relaxed assertions;
+21. every C-S1 through C-S12 reusable function has an exact executable wrapper, manifest entry, and evidence row; expected-unsupported diagnostics cannot be counted as passed;
+22. passed evidence contains exact executable commands, `passed` results, one verified immutable run URL, immutable Coven plan/spec URLs and SHA-256 values, and no candidate placeholders;
+23. the C-S10 result and every artifact carry validated digest, media type, size, expiry, and the exact `AdoptionRequest::correlation()` derived from the launch golden, with strict fixture, mismatch, and retention-owner tests;
+24. every filtered evidence command uses an exact manifest-listed test that Cargo `--list` proves exists, so zero-match success is rejected;
+25. `RecordKind::Attempt` and `att_` are the sole execution-binding identity kind/prefix; there is no duplicate binding-named record-kind variant and every exhaustive mapping/test agrees;
+26. full local and remote gates pass for the attested source SHA, every later commit through the reviewed evidence head changes only `docs/G2-EVIDENCE.md`, and no W3-W9 policy or G4+ capability is enabled.
