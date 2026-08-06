@@ -821,24 +821,33 @@ test('release workflow preflights selected native package availability before pu
     jobStarts.find((match) => match.index > publishStart)?.index ?? workflow.length;
   const publish = workflow.slice(publishStart, publishEnd);
   const preflightStart = publish.indexOf('name: Preflight npm native package availability');
-  const firstPublishStart = publish.indexOf(
-    'node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper'
-  );
+  const nativePublishCommands = [
+    'node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper',
+    'node scripts/publish-npm.mjs --target=windows --skip-build --publish --skip-wrapper',
+    'node scripts/publish-npm.mjs --target=macos-x64 --skip-build --publish --skip-wrapper',
+    'node scripts/publish-npm.mjs --target=macos --skip-build --publish --skip-wrapper',
+  ];
+  const nativePublishStarts = nativePublishCommands.map((command) => publish.indexOf(command));
 
   assert.ok(preflightStart !== -1, 'npm-publish must preflight selected native package records');
-  assert.ok(firstPublishStart !== -1, 'npm-publish must contain its first native publish command');
-  assert.ok(
-    preflightStart < firstPublishStart,
-    'native package availability preflight must run before the first publish command'
-  );
-  const preflight = publish.slice(preflightStart, firstPublishStart);
+  nativePublishStarts.forEach((nativePublishStart, index) => {
+    assert.ok(
+      nativePublishStart !== -1,
+      `npm-publish must contain ${nativePublishCommands[index]}`
+    );
+    assert.ok(
+      preflightStart < nativePublishStart,
+      `native package availability preflight must run before ${nativePublishCommands[index]}`
+    );
+  });
+  const preflight = publish.slice(preflightStart, Math.min(...nativePublishStarts));
 
   assert.match(preflight, /RELEASE_MODE: \$\{\{ needs\.verify-tag\.outputs\.release_mode \}\}/);
   assert.match(preflight, /NATIVE_PACKAGE_SET: \$\{\{ needs\.verify-tag\.outputs\.native_package_set \}\}/);
   assert.match(preflight, /npm view "\$package_name" name/);
   assert.match(preflight, /@opencoven\/cli-linux-x64/);
   assert.match(preflight, /@opencoven\/cli-windows/);
-  assert.match(preflight, /@opencoven\/cli-macos/);
+  assert.match(preflight, /@opencoven\/cli-macos(?:\s|$)/);
   assert.match(preflight, /@opencoven\/cli-macos-x64/);
   assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
   assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
