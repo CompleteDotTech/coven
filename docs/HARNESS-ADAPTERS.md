@@ -9,7 +9,14 @@ description: "How Coven harness adapters work, how external adapters graduate, a
 
 # Harness adapter guide
 
-Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set for Codex, Claude Code, and GitHub Copilot CLI, but no harness should become privileged runtime logic. OpenClaw, Hermes, Aider, Gemini, and future agents should enter through the same adapter contract and maturity checklist.
+Coven should treat every harness as an adapter. The daemon ships a small bundled compatibility adapter set, but no harness should become privileged runtime logic. Adapters outside that set enter through the same adapter contract and maturity checklist.
+
+| Maturity | Members | Install direction |
+| --- | --- | --- |
+| Bundled compatibility default | Codex, Claude Code, GitHub Copilot CLI | Install the harness; no Coven recipe. |
+| Trusted opt-in recipe | Hermes 1.0.3, OpenCode 0.1.1 | Install the upstream CLI, then its named Coven recipe (for example, `coven adapter install hermes`). |
+| Experimental opt-in recipe | Grok Build 1.0.0 | Install the upstream CLI and recipe; the promotion checklist remains open. |
+| Future adapter direction | Aider, Gemini, Cline, custom | No bundled or trusted-recipe claim. |
 
 The goal is a harness-neutral runtime:
 
@@ -259,12 +266,18 @@ claude doctor
 OpenClaw is the first external integration boundary for Coven, but it is not a daemon-launched harness id. The external OpenClaw bridge plugin is an external OpenClaw ACP runtime bridge:
 
 - OpenClaw registers ACP backend id `coven`.
-- The bridge talks to the local Coven daemon over the configured Unix socket.
+- Generic bridge clients use the daemon-reported, platform-appropriate
+  same-user local IPC endpoint (a Unix socket on Unix-like systems or an
+  owner-only named pipe on Windows).
 - OpenClaw chooses an ACP agent id, maps it to a Coven harness id, and launches a project-scoped Coven session.
 - Coven validates the project root, harness id, session id, input, and kill requests.
 - OpenClaw keeps responsibility for its own UI, chat/session routing, plugin lifecycle, and ACP bindings.
 
-This is the integration shape future clients should follow: consume Coven's socket API and adapter discovery, do not import daemon internals or require Coven to know OpenClaw internals.
+The current external OpenClaw plugin is a Unix-specific exception: its
+trust-anchor validation requires a Unix socket, so this guidance does not claim
+that plugin supports Windows. Future clients should consume the daemon's
+platform-appropriate endpoint and adapter discovery, not import daemon
+internals or require Coven to know OpenClaw internals.
 
 ## Adapter requirements
 

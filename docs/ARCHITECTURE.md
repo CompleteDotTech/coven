@@ -40,10 +40,11 @@ flowchart LR
   end
 
   subgraph Adapters["Harness adapters"]
-    Codex["Codex PTY"]
-    Claude["Claude Code PTY"]
+    Bundled["Bundled compatibility defaults\nCodex / Claude Code / GitHub Copilot CLI"]
+    Trusted["Trusted opt-in recipes\nHermes 1.0.3 / OpenCode 0.1.1"]
+    Experimental["Experimental opt-in recipe\nGrok Build 1.0.0"]
+    Future["Future direction\nAider / Gemini / Cline / custom"]
     DesktopUse["desktop-use adapters"]
-    Future["Hermes / Aider / Gemini\n(future adapters)"]
   end
 
   subgraph Storage["Persistent storage"]
@@ -58,10 +59,10 @@ flowchart LR
   Rust --> Events
 
   User --> SocketClients
-  SocketClients -->|"HTTP over Unix socket"| Daemon
-  Comux -->|"HTTP over Unix socket"| Daemon
+  SocketClients -->|"HTTP over same-user local IPC"| Daemon
+  Comux -->|"HTTP over same-user local IPC"| Daemon
   OpenClaw --> Plugin
-  Plugin -->|"HTTP over Unix socket"| Daemon
+  Plugin -->|"HTTP over same-user local IPC"| Daemon
 
   Daemon --> Control
   Control --> Policy
@@ -70,14 +71,16 @@ flowchart LR
 
   Daemon --> Boundary
   Boundary --> HarnessRouter
-  HarnessRouter --> Codex
-  HarnessRouter --> Claude
-  HarnessRouter -.->|future| Future
+  HarnessRouter --> Bundled
+  HarnessRouter -.->|opt-in recipe| Trusted
+  HarnessRouter -.->|experimental recipe| Experimental
+  HarnessRouter -.->|future direction| Future
 
   Daemon --> Store
   Daemon --> Events
-  Codex --> Events
-  Claude --> Events
+  Bundled --> Events
+  Trusted --> Events
+  Experimental --> Events
 ```
 
 ## Session lifecycle
@@ -188,10 +191,14 @@ desktop/apps -> Coven -> chat/intake client UI updates
 
 ## Current user-facing surface
 
-- `coven` and `coven tui` open the beginner-friendly slash-command palette.
+- `coven`, `coven chat`, and `coven tui` open the managed interactive UI
+  powered by `coven-code`. The first interactive run offers to install the
+  pinned engine if it is missing.
+- `COVEN_LEGACY_TUI=1` explicitly enables the deprecated, temporary
+  in-process TUI compatibility fallback. It will be removed.
 - `coven doctor` checks store/project/harness readiness and prints next steps.
 - `coven daemon start/status/restart/stop` manages the local daemon.
-- `coven run codex|claude <prompt>` launches a project-scoped PTY session.
+- `coven run codex|claude|copilot <prompt>` launches a project-scoped PTY session.
 - `coven sessions` opens the human session browser in a terminal; `--plain` keeps scriptable output.
 - Session browser actions surface readable choices: **Rejoin**, **View Log**, **Summon**, **Archive**, and **Sacrifice**.
 - `coven attach|summon|archive|sacrifice <session-id>` remain explicit lower-level verbs for scripts and copy/paste workflows.
@@ -214,6 +221,9 @@ The npm wrapper packages are live for early adopters:
 - `@opencoven/cli-macos`
 - `@opencoven/cli-macos-x64`
 - `@opencoven/cli-linux-x64`
-- `@opencoven/cli-windows` once the next Windows-enabled release is published
+- `@opencoven/cli-windows` (published Windows x64 platform package)
 
-The source package versions stay template-like in the repo; release workflow dispatch supplies the published version and builds platform packages. As of the current documentation pass, npm latest is `0.0.10` for the wrapper plus macOS/Linux packages; Windows x64 release wiring is staged for the next package release.
+Source supports native Windows, including owner-only named-pipe daemon
+transport. The wrapper installs the platform package version declared by that
+wrapper release. Publication of `@opencoven/cli-windows` therefore does not
+establish that every direct CLI operation is portable on Windows.

@@ -10,11 +10,12 @@ description: "Reference for coven status, familiars, skills, memory, research, c
 # Observability commands
 
 Everything the CovenCave dashboard reads is also visible from the terminal.
-The commands in the table below are **read-only**, work **without a running
-daemon** (they read the same `~/.coven` files and SQLite store the daemon
-serves), and each takes `--json` for machine-readable output that carries the
-same body as the corresponding daemon API route. `coven memory open` is a
-separate local-dashboard launcher described after the table.
+The commands in the table below are **read-only** and each takes `--json` for
+machine-readable output that carries the same body as the corresponding daemon
+API route. Most read persisted `~/.coven` files and SQLite state without a
+running daemon; `coven hub status` requires the daemon's live hub snapshot.
+`coven memory open` is a separate local-dashboard launcher described after the
+table.
 
 | Command | Human view | `--json` body |
 |---|---|---|
@@ -24,7 +25,7 @@ separate local-dashboard launcher described after the table.
 | `coven memory` | Memory file table | `GET /api/v1/memory` |
 | `coven research` | Research loop log | `GET /api/v1/research` |
 | `coven calls [<id>]` | Delegation ledger (list or detail) | `GET /api/v1/coven-calls[/:id]` |
-| `coven hub status` | Hub role, nodes, queue depth | `GET /api/v1/hub/status` |
+| `coven hub status` | Hub role, nodes, queue depth (requires a running daemon) | `GET /api/v1/hub/status` |
 | `coven hub nodes` | Executor node table | `GET /api/v1/hub/nodes` |
 | `coven hub jobs [--state <s>]` | Job table | `GET /api/v1/hub/jobs[?state=s]` |
 | `coven hub routing` | Routing decisions | `GET /api/v1/hub/routing` |
@@ -45,7 +46,7 @@ commands continue to support Node.js 18 or newer.
 ## coven status
 
 The "what is my coven doing" front door. Complements `coven doctor`
-(is my *setup* healthy?) with runtime state:
+(is my *setup* healthy?) with runtime state. This is a Unix-like example:
 
 ```text
 Coven status
@@ -60,6 +61,9 @@ Coven status
 
 Next: coven sessions · coven familiars · coven run <harness> "<task>"
 ```
+
+On Windows, the daemon line reports the owner-only named-pipe endpoint instead
+of a `.sock` path.
 
 - The `familiars` line counts a familiar as **active** when it has an open
   session; the roster comes from `~/.coven/familiars.toml`.

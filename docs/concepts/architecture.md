@@ -4,27 +4,27 @@ read_when:
   - Understanding how CastCodes, Coven, and advanced clients fit together
   - Auditing trust boundaries before adding a new client
 title: "Architecture"
-description: "Conceptual map of Coven: CastCodes as the primary workspace, the Rust daemon as authority, the CLI/TUI, advanced clients, and the versioned local socket API contract that joins them."
+description: "Conceptual map of Coven: CastCodes as the primary workspace, the Rust daemon as authority, the CLI/TUI, advanced clients, and the versioned local IPC API contract that joins them."
 ---
 
 Coven is a local-first harness substrate. CastCodes is the primary workspace and proof surface; the Rust CLI/daemon is the authority layer. The CLI/TUI, comux, and the optional OpenClaw plugin are operator, legacy, or advanced integration layers.
 
-The versioned local socket API contract lives in [API contract](/reference/api-contract). Clients should handshake with [`GET /api/v1/health`](/daemon/health) and negotiate against `apiVersion: "coven.daemon.v1"` plus the `capabilities` object before depending on session or event response shapes. All error responses use the structured `{ error: { code, message, details } }` envelope documented in [Error envelope](/daemon/error-envelope).
+The versioned local IPC API contract lives in [API contract](/reference/api-contract). The daemon uses a filesystem-permission-protected Unix socket on Unix-like hosts or an owner-only named pipe on Windows, and does not bind TCP by default. Clients should handshake with [`GET /api/v1/health`](/daemon/health) and negotiate against `apiVersion: "coven.daemon.v1"` plus the `capabilities` object before depending on session or event response shapes. All error responses use the structured `{ error: { code, message, details } }` envelope documented in [Error envelope](/daemon/error-envelope).
 
 ## Runtime topology
 
 ```mermaid
 flowchart LR
   User[Developer] --> CastCodes[CastCodes workspace]
-  CastCodes -->|HTTP over Unix socket| Daemon[Coven daemon]
+  CastCodes -->|HTTP over same-user local IPC| Daemon[Coven daemon]
 
   User --> CLI[coven CLI / TUI]
   CLI -->|direct commands| Rust[Coven Rust CLI]
   Rust --> Daemon
 
-  Comux[comux legacy/reference] -.->|HTTP over Unix socket| Daemon
+  Comux[comux legacy/reference] -.->|HTTP over same-user local IPC| Daemon
   OpenClaw[OpenClaw] --> Plugin[external OpenClaw bridge plugin]
-  Plugin -.->|HTTP over Unix socket| Daemon
+  Plugin -.->|HTTP over same-user local IPC| Daemon
 
   Daemon --> Control[Control plane: capability discovery + action routing]
   Control --> Policy[Policy + permission hints]
@@ -33,14 +33,16 @@ flowchart LR
 
   Daemon --> Boundary[Project-root + cwd guard]
   Boundary --> Adapter[Harness adapter router]
-  Adapter --> Codex[Codex PTY]
-  Adapter --> Claude[Claude Code PTY]
-  Adapter -. future .-> Future[Hermes / Aider / Gemini / custom adapters]
+  Adapter --> Bundled[Bundled compatibility defaults: Codex / Claude Code / GitHub Copilot CLI]
+  Adapter -. opt-in recipe .-> Trusted[Trusted recipes: Hermes 1.0.3 / OpenCode 0.1.1]
+  Adapter -. experimental recipe .-> Experimental[Experimental recipe: Grok Build 1.0.0]
+  Adapter -. future direction .-> Future[Aider / Gemini / Cline / custom]
 
   Daemon --> Store[(SQLite session ledger)]
   Daemon --> Events[(append-only event log)]
-  Codex --> Events
-  Claude --> Events
+  Bundled --> Events
+  Trusted --> Events
+  Experimental --> Events
 ```
 
 ## Session lifecycle

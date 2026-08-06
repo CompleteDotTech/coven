@@ -10,7 +10,7 @@ Run Codex, Claude Code, GitHub Copilot CLI, and future coding harnesses inside e
 Launch, observe, attach, and coordinate agent work through one neutral runtime substrate.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-9A8ECD?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-9A8ECD?style=flat-square)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20x64-9A8ECD?style=flat-square)](#requirements)
 [![npm](https://img.shields.io/badge/npm-%40opencoven%2Fcli-9A8ECD?style=flat-square)](https://www.npmjs.com/package/@opencoven/cli)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-9A8ECD?style=flat-square)](https://www.rust-lang.org/)
 
@@ -22,7 +22,9 @@ Launch, observe, attach, and coordinate agent work through one neutral runtime s
 
 ---
 
-> **⚠️ Early MVP** — Coven is a local-first runtime in active development. It is usable by adventurous developers on macOS and Linux. The npm package is live. Expect rough edges.
+> **⚠️ Early MVP** — Coven is a local-first runtime in active development. It
+> is usable by adventurous developers on macOS, Linux, and Windows x64. The
+> npm package is live. Expect rough edges.
 >
 > **External PRs are open** — Start from an issue for larger changes, keep PRs scoped, and include the readiness packet requested by the PR template.
 
@@ -64,7 +66,7 @@ Coven doesn't replace your coding agent, your UI, or other clients. It acts as a
 
 - **You choose the harness** — Codex, Claude Code, GitHub Copilot CLI, or future adapters.
 - **Coven owns the session** — project-scoped boundaries, PTY execution, event logging, SQLite persistence.
-- **Clients present the work** — CastCodes, the CLI/TUI, comux, or your own integration over the local socket API.
+- **Clients present the work** — CastCodes, the CLI/TUI, comux, or your own integration over the same-user local IPC API.
 
 The Rust daemon is the authority boundary. All clients — including the CLI itself — are convenience layers. Security decisions flow inward to the daemon, never outward to clients.
 
@@ -78,7 +80,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 | No project boundary enforcement                     | Agent is locked to an explicit project root; cannot escape  |
 | Lose track of agent work when the terminal closes   | Sessions persist across daemon restarts via SQLite          |
 | Manually juggle multiple harness CLIs               | One unified `coven run` entry point for all harnesses       |
-| No API for clients to consume agent sessions        | Versioned `coven.daemon.v1` socket API for all clients      |
+| No API for clients to consume agent sessions        | Versioned `coven.daemon.v1` same-user local IPC API for all clients |
 | No standard way to observe or replay past work      | `coven sessions` browser with Rejoin, View Log, and Archive |
 
 ---
@@ -86,10 +88,10 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 ## Features
 
 - **🏠 Project-root boundaries** — Every launch is tied to an explicit repository or project root. The daemon rejects working directories that escape the declared boundary.
-- **🔌 Harness-neutral runtime** — bundled support stays focused on Codex, Claude Code, and GitHub Copilot CLI; trusted opt-in recipes cover Grok Build, Hermes, and OpenCode through the same adapter path used by future harnesses.
+- **🔌 Harness-neutral runtime** — bundled support stays focused on Codex, Claude Code, and GitHub Copilot CLI; trusted opt-in recipes cover Hermes and OpenCode, while Grok Build is an experimental opt-in recipe.
 - **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, restored, or sacrificed without memorizing IDs.
 - **📡 Attachable PTY sessions** — Live sessions can be replayed or followed from explicit CLI verbs.
-- **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned socket contract (`coven.daemon.v1`).
+- **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned local IPC contract (`coven.daemon.v1`).
 - **🗄️ SQLite-backed history** — Session metadata and event logs survive daemon restarts.
 - **🦀 Rust authority layer** — Launch, cwd, input, kill, and path-sensitive requests are revalidated in Rust. Clients are never the trust boundary.
 - **🔒 External OpenClaw bridge** — `@opencoven/coven` is an opt-in plugin; OpenClaw core does not include Coven code.
@@ -104,7 +106,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 | ---------------------------- | --------------------------------------------------------------------------- |
 | **Rust stable toolchain**    | Required only when building from source                                     |
 | **Git**                      | Required                                                                    |
-| **macOS, Linux, or Windows x64** | Native npm packages are published for all three platforms                  |
+| **macOS arm64/x64, glibc-based Linux x64, or Windows x64** | Native npm packages are available for these targets |
 | **Node.js 18+**              | Required for the npm wrapper; `coven memory open` requires Node.js 24+      |
 | **At least one harness CLI** | Codex, Claude Code, and/or GitHub Copilot CLI (see below)                    |
 
@@ -169,7 +171,7 @@ dashboard requires Node.js 24 or newer; on an older runtime, only
 | `@opencoven/cli`           | Universal wrapper — auto-selects your platform |
 | `@opencoven/cli-macos`     | macOS Apple Silicon                            |
 | `@opencoven/cli-macos-x64` | macOS Intel x64                                |
-| `@opencoven/cli-linux-x64` | Linux x64                                      |
+| `@opencoven/cli-linux-x64` | glibc-based Linux x64 (Alpine unsupported)    |
 | `@opencoven/cli-windows`   | Windows x64                                    |
 | `@opencoven/coven-memory-dashboard` | Optional loopback memory dashboard companion |
 
@@ -252,7 +254,8 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [`cli-run.md`](docs/reference/cli-run.md) |
 | `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [`cli-sessions.md`](docs/reference/cli-sessions.md) |
 | `coven attach <id>` | Replay/follow session output and forward input | [`cli-attach.md`](docs/reference/cli-attach.md) |
-| `coven archive` / `summon` / `sacrifice` / `kill` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md), [`cli-kill.md`](docs/reference/cli-kill.md) |
+| `coven archive` / `summon` / `sacrifice` | Session rituals (see below) | [`cli-archive.md`](docs/reference/cli-archive.md), [`cli-summon.md`](docs/reference/cli-summon.md), [`cli-sacrifice.md`](docs/reference/cli-sacrifice.md) |
+| `coven kill` | Stop a live session on Unix-like hosts; Windows-capable integrations request `POST /api/v1/sessions/:id/kill` through daemon local IPC | [`cli-kill.md`](docs/reference/cli-kill.md) |
 | `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) |
 | `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [`cli-observe.md`](docs/reference/cli-observe.md) |
 | `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [`cli-observe.md`](docs/reference/cli-observe.md) |
@@ -279,7 +282,12 @@ The full command surface — every subcommand, flag, and JSON output shape — l
 
 ## Local API
 
-The daemon exposes a versioned HTTP API over a Unix socket. The current public contract is `coven.daemon.v1` (prefix: `/api/v1`).
+The daemon exposes a versioned HTTP API over same-user local IPC. On Unix-like
+hosts, this is `<COVEN_HOME>/coven.sock`; on Windows, it is an owner-only named
+pipe selected by `COVEN_HOME`. Health and `coven daemon status` report the
+active endpoint, so clients must not construct a Windows pipe name from the
+Unix convention. The current public contract is `coven.daemon.v1` (prefix:
+`/api/v1`).
 
 The complete endpoint index — contract discovery, sessions and events, observability reads, travel, scheduler, and the hub control plane — lives in [`docs/reference/api.md`](docs/reference/api.md). [`docs/API.md`](docs/API.md) covers the architecture and auth posture, and [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) is the full versioned contract: shapes, error codes, cursor pagination, and compatibility rules.
 
@@ -288,7 +296,7 @@ The complete endpoint index — contract discovery, sessions and events, observa
 All API clients should start with a health negotiation:
 
 ```bash
-# Example: health check via Unix socket
+# Unix-like example: health check via Unix socket
 curl --unix-socket ~/.coven/coven.sock http://localhost/api/v1/health
 ```
 
@@ -314,7 +322,7 @@ Direct native binary installs can place `coven-memory-dashboard` on `PATH` or
 install the package globally. The dashboard requires Node.js 24 or newer; the
 rest of the npm-wrapped CLI remains available on Node.js 18 or newer.
 
-Treat the socket API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
+Treat the local IPC API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
 
 ---
 
@@ -328,8 +336,8 @@ Coven is a local-first harness substrate. The Rust daemon is the authority bound
 Developer
   │
   ├── CastCodes workspace ─────────────────────┐
-  ├── coven CLI / TUI ─────────────────────────┤ HTTP over Unix socket
-  ├── comux (legacy/reference) ────────────────┤ ~/.coven/coven.sock
+  ├── coven CLI / TUI ─────────────────────────┤ HTTP over local IPC
+  ├── comux (legacy/reference) ────────────────┤ daemon-reported endpoint
   └── @opencoven/coven (OpenClaw plugin) ───────┘
                                                 │
                                 ┌───────────────▼──────────────────┐
@@ -429,7 +437,7 @@ coven/
 
 **Key directories:**
 
-- **`crates/coven-cli`** — Everything that becomes the `coven` binary. This is where daemon, PTY adapter, session store, socket API, and CLI surface live in Rust.
+- **`crates/coven-cli`** — Everything that becomes the `coven` binary. This is where daemon, PTY adapter, session store, local IPC API, and CLI surface live in Rust.
 - **`packages/openclaw-coven`** — The opt-in bridge between OpenClaw and Coven. Lives here (not in OpenClaw core) to keep the trust boundary clean. Published as `@opencoven/coven`.
 - **`scripts/check-secrets.py`** — Required pre-release and pre-PR scan. Run it before pushing to avoid leaking credentials into git history.
 - **`docs/`** — The canonical documentation suite. All product docs, architecture, API contract, safety model, and roadmap live here.
@@ -442,7 +450,7 @@ Coven works with zero configuration. State lives under `COVEN_HOME` (default `~/
 
 | Surface                              | What it controls                                                                          | Reference                                                        |
 | ------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
-| `COVEN_HOME`                         | Root directory for all daemon state: SQLite database, Unix socket, logs, encryption keys | [`docs/daemon/coven-home.md`](docs/daemon/coven-home.md)         |
+| `COVEN_HOME`                         | Root directory for daemon state: SQLite database, same-user local IPC, logs, encryption keys | [`docs/daemon/coven-home.md`](docs/daemon/coven-home.md)         |
 | Daemon environment and `privacy.toml` | Raw-artifact persistence (`COVEN_PERSIST_RAW_ARTIFACTS`), retention windows, redaction     | [`docs/daemon/configuration.md`](docs/daemon/configuration.md)   |
 | `~/.config/coven/settings.json`      | CLI settings under `covenCli.*`: repo registry, privacy keys, fuzzy paths                  | [`docs/SETTINGS.md`](docs/SETTINGS.md)                           |
 
@@ -468,13 +476,13 @@ Never commit runtime state: `.coven/`, `*.sqlite*`, `*.db`, `*.sock`, `.env*`, a
 
 ## OpenCoven Integrations
 
-Coven is the runtime layer. Other surfaces in the OpenCoven ecosystem sit above it and connect through the local socket API.
+Coven is the runtime layer. Other surfaces in the OpenCoven ecosystem sit above it and connect through same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or a daemon-reported owner-only named pipe on Windows.
 
 | Integration                                              | Role                                                                       | How it connects                          |
 | -------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------- |
-| **[CastCodes](https://github.com/OpenCoven/cast-codes)** | Primary public workspace; the local-first AI coding product built on Coven | HTTP over Unix socket                    |
-| **comux**                                                | Legacy terminal cockpit (useful reference; not the future public story)    | HTTP over Unix socket                    |
-| **OpenClaw**                                             | External coding agent; integrates via opt-in plugin only                   | `@opencoven/coven` plugin → socket       |
+| **[CastCodes](https://github.com/OpenCoven/cast-codes)** | Primary public workspace; the local-first AI coding product built on Coven | HTTP over same-user local IPC            |
+| **comux**                                                | Legacy terminal cockpit (useful reference; not the future public story)    | HTTP over same-user local IPC            |
+| **OpenClaw**                                             | External coding agent; integrates via opt-in plugin only                   | `@opencoven/coven` plugin → local IPC    |
 
 > **Important:** OpenClaw core does not contain Coven code. The integration lives exclusively in `packages/openclaw-coven` and publishes as `@opencoven/coven`. This separation keeps the trust boundary clean — the plugin is treated as an untrusted socket client, and the Rust daemon revalidates every request it makes.
 
@@ -511,7 +519,7 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 | [Session lifecycle](docs/SESSION-LIFECYCLE.md)          | Detailed state machine for sessions                                   |
 | [Safety model](docs/SAFETY-MODEL.md)                    | Trust boundary, local access model, data rules                        |
 | [Operational model](docs/OPERATIONAL-MODEL.md)          | Day-to-day operation and daemon management                            |
-| [Client integration guide](docs/CLIENT-INTEGRATION.md)  | How to build a client against the socket API                          |
+| [Client integration guide](docs/CLIENT-INTEGRATION.md)  | How to build a client against the same-user local IPC API              |
 | [Harness adapter guide](docs/HARNESS-ADAPTERS.md)       | How to implement a new harness adapter                                |
 | [Troubleshooting](docs/TROUBLESHOOTING.md)              | Diagnose and resolve common issues                                    |
 | [Public roadmap](docs/ROADMAP.md)                       | Shipped, now, next, and later milestones                              |
@@ -530,7 +538,7 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 
 **Q: What is Coven, exactly?**
 
-Coven is a local Rust daemon and CLI that supervises coding-agent CLI sessions (like Codex or Claude Code) inside explicit project boundaries, records everything to SQLite, and exposes it all through a versioned local HTTP API over a Unix socket.
+Coven is a local Rust daemon and CLI that supervises coding-agent CLI sessions (like Codex or Claude Code) inside explicit project boundaries, records everything to SQLite, and exposes it through a versioned HTTP API over same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or a daemon-reported owner-only named pipe on Windows.
 
 **Q: Does Coven replace Codex or Claude Code?**
 
@@ -554,7 +562,7 @@ Sacrifice is Coven's intentionally explicit verb for permanently deleting a sess
 
 **Q: What is `COVEN_HOME`?**
 
-The directory where Coven stores all local state: SQLite database, Unix socket, logs, and encryption keys. Defaults to `~/.coven`. To isolate environments (e.g., in CI), set `COVEN_HOME` to a separate path for each environment.
+The directory where Coven stores all local state: SQLite database, same-user local IPC, logs, and encryption keys. On Unix-like hosts, IPC uses `COVEN_HOME/coven.sock`; on Windows, it uses a daemon-reported owner-only named pipe. Defaults to `~/.coven`. To isolate environments (e.g., in CI), set `COVEN_HOME` to a separate path for each environment.
 
 **Q: Is CastCodes the same as Coven?**
 
@@ -566,7 +574,7 @@ OpenClaw is an external coding agent that can optionally integrate with Coven th
 
 **Q: Can I build my own client on top of Coven?**
 
-Yes. The daemon exposes a stable `coven.daemon.v1` HTTP API over a local Unix socket. All clients are untrusted for enforcement, but the API surface is stable and versioned. See [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) and [`docs/CLIENT-INTEGRATION.md`](docs/CLIENT-INTEGRATION.md).
+Yes. The daemon exposes a stable `coven.daemon.v1` HTTP API over same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or a daemon-reported owner-only named pipe on Windows. All clients are untrusted for enforcement, but the API surface is stable and versioned. See [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) and [`docs/CLIENT-INTEGRATION.md`](docs/CLIENT-INTEGRATION.md).
 
 **Q: What if I want to add a new harness (like Aider or Gemini)?**
 
@@ -658,7 +666,7 @@ cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule
 ```
 
 The runner uses disposable `COVEN_HOME` directories, a fixture-only fake Codex
-executable, and the local socket API. It records command startup, cold daemon
+executable, and the same-user local IPC API. It records command startup, cold daemon
 start-to-health, daemon session-listing, event-tail, and harness-first-output
 timings without reading real configuration, prompts, or session logs. Each cold
 start sample gets a fresh home and a matching daemon stop. The ignored Rust test
@@ -705,11 +713,11 @@ failure; unrelated persistence errors remain fail-fast.
 
 ### Architecture rules for contributors
 
-- **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and socket request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.
+- **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and local IPC request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.
 - **All clients are untrusted for enforcement** — this includes comux and the OpenClaw plugin.
 - **Keep harness support focused.** Supported harnesses are Codex, Claude Code, and GitHub Copilot CLI only until adapter contracts are stable.
 - **OpenClaw separation.** Do not place Coven code in OpenClaw core. The integration belongs in `packages/openclaw-coven` as `@opencoven/coven`.
-- **No future orchestration commands as user-facing** until they exist in the CLI and socket API.
+- **No future orchestration commands as user-facing** until they exist in the CLI and local IPC API.
 
 ### Documentation rules
 
