@@ -926,8 +926,8 @@ test('release workflow preflights selected native package availability before pu
   assert.match(preflight, /@opencoven\/cli-windows/);
   assert.match(preflight, /@opencoven\/cli-macos/);
   assert.match(preflight, /@opencoven\/cli-macos-x64/);
-  assert.match(preflight, /RELEASE_MODE.*normal/s);
-  assert.match(preflight, /NATIVE_PACKAGE_SET.*post-intel/s);
+  assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
+  assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
   assert.match(preflight, /non-latest bootstrap version/);
   assert.match(preflight, /release-npm\.yml/);
 });
