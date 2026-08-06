@@ -820,44 +820,54 @@ test('release workflow preflights selected native package availability before pu
   const publishEnd =
     jobStarts.find((match) => match.index > publishStart)?.index ?? workflow.length;
   const publish = workflow.slice(publishStart, publishEnd);
-  const preflightStart = publish.indexOf('name: Preflight npm native package availability');
+  const preflightStepMatch = publish.match(
+    /^      - name: Preflight npm native package availability$/m
+  );
+  assert.ok(preflightStepMatch, 'npm-publish must preflight selected native package records');
+  const preflightStart = preflightStepMatch.index;
   const nativePublishCommands = [
     'node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper',
     'node scripts/publish-npm.mjs --target=windows --skip-build --publish --skip-wrapper',
     'node scripts/publish-npm.mjs --target=macos-x64 --skip-build --publish --skip-wrapper',
-    'node scripts/publish-npm.mjs --target=macos --skip-build --publish --skip-wrapper',
+    'node scripts/publish-npm.mjs --target=macos --skip-build --publish --skip-wrapper'
   ];
-  const nativePublishStarts = nativePublishCommands.map((command) => publish.indexOf(command));
+  const nativePublishStarts = nativePublishCommands.map((command) => {
+    const nativePublishMatch = publish.match(
+      new RegExp(String.raw`^      - run: ${command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm')
+    );
+    assert.ok(nativePublishMatch, `npm-publish must contain ${command}`);
+    return nativePublishMatch.index;
+  });
 
-  assert.ok(preflightStart !== -1, 'npm-publish must preflight selected native package records');
   const preflightEndStart = publish.indexOf('\n      - ', preflightStart + 1);
   const preflightEnd = preflightEndStart === -1 ? publish.length : preflightEndStart;
   const preflight = publish.slice(preflightStart, preflightEnd);
   nativePublishStarts.forEach((nativePublishStart, index) => {
-    assert.ok(
-      nativePublishStart !== -1,
-      `npm-publish must contain ${nativePublishCommands[index]}`
-    );
     assert.ok(
       preflightStart < nativePublishStart,
       `native package availability preflight must run before ${nativePublishCommands[index]}`
     );
   });
 
-  assert.match(preflight, /RELEASE_MODE: \$\{\{ needs\.verify-tag\.outputs\.release_mode \}\}/);
-  assert.match(preflight, /NATIVE_PACKAGE_SET: \$\{\{ needs\.verify-tag\.outputs\.native_package_set \}\}/);
-  assert.match(preflight, /npm view "\$package_name" name/);
-  assert.match(preflight, /@opencoven\/cli-linux-x64/);
-  assert.match(preflight, /@opencoven\/cli-windows/);
-  assert.match(preflight, /@opencoven\/cli-macos(?:\s|$)/);
-  assert.match(preflight, /@opencoven\/cli-macos-x64/);
+  assert.match(
+    preflight,
+    /^          RELEASE_MODE: \$\{\{ needs\.verify-tag\.outputs\.release_mode \}\}$/m
+  );
+  assert.match(
+    preflight,
+    /^          NATIVE_PACKAGE_SET: \$\{\{ needs\.verify-tag\.outputs\.native_package_set \}\}$/m
+  );
+  assert.match(
+    preflight,
+    /^          if output=\$\(npm view "\$package_name" name\); then$/m
+  );
   assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
   assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
   assert.match(preflight, /non-latest bootstrap version/);
   assert.match(preflight, /release-npm\.yml/);
 
   const normalBranchMatch = preflight.match(
-    /\[ "\$RELEASE_MODE" = "normal" \][\s\S]*?(?=\n\s*elif\b)/
+    /\[ "\$RELEASE_MODE" = "normal" \][\s\S]*?(?=\n\s*(?:elif|else|fi)\b)/
   );
   assert.ok(normalBranchMatch, 'preflight must contain the normal package-check branch');
   const normalBranch = normalBranchMatch[0];
@@ -869,20 +879,26 @@ test('release workflow preflights selected native package availability before pu
   ]) {
     assert.match(
       normalBranch,
-      new RegExp(String.raw`require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`),
+      new RegExp(
+        String.raw`^          require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`,
+        'm'
+      ),
       `normal branch must require ${packageName}`
     );
   }
 
   const postIntelBranchMatch = preflight.match(
-    /elif \[ "\$NATIVE_PACKAGE_SET" = "post-intel" \][\s\S]*?(?=\n\s*elif\b)/
+    /elif \[ "\$NATIVE_PACKAGE_SET" = "post-intel" \][\s\S]*?(?=\n\s*(?:elif|else|fi)\b)/
   );
   assert.ok(postIntelBranchMatch, 'preflight must contain the post-intel package-check branch');
   const postIntelBranch = postIntelBranchMatch[0];
   for (const packageName of ['@opencoven/cli-macos', '@opencoven/cli-macos-x64']) {
     assert.match(
       postIntelBranch,
-      new RegExp(String.raw`require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`),
+      new RegExp(
+        String.raw`^          require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`,
+        'm'
+      ),
       `post-intel branch must require ${packageName}`
     );
   }
