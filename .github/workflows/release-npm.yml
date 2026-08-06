@@ -162,7 +162,9 @@ jobs:
               scripts/publish-npm-test.mjs|\
               docs/reference/releasing.md|\
               docs/superpowers/specs/2026-08-01-release-partial-publish-recovery-design.md|\
-              docs/superpowers/plans/2026-08-01-release-partial-publish-recovery.md)
+              docs/superpowers/plans/2026-08-01-release-partial-publish-recovery.md|\
+              docs/superpowers/specs/2026-08-06-v0.2.4-intel-macos-recovery-design.md|\
+              docs/superpowers/plans/2026-08-06-v0.2.4-intel-macos-recovery.md)
                 ;;
               *)
                 echo "::error::Refusing recovery: changed path $changed_path is not release-only."
@@ -346,6 +348,33 @@ jobs:
             exit 1
           fi
           expect_missing @opencoven/cli
+      - name: Preflight npm native package availability
+        env:
+          RELEASE_MODE: ${{ needs.verify-tag.outputs.release_mode }}
+          NATIVE_PACKAGE_SET: ${{ needs.verify-tag.outputs.native_package_set }}
+        run: |
+          set -euo pipefail
+          require_package() {
+          local package_name="$1"
+          local output
+          if output=$(npm view "$package_name" name); then
+          return 0
+          fi
+          printf '%s\n' "$output"
+          echo "::error::Refusing non-latest bootstrap version publish in OpenCoven/coven release-npm.yml because npm package $package_name is unavailable."
+          exit 1
+          }
+          if [ "$RELEASE_MODE" = "normal" ]; then
+          require_package @opencoven/cli-linux-x64
+          require_package @opencoven/cli-windows
+          require_package @opencoven/cli-macos-x64
+          require_package @opencoven/cli-macos
+          elif [ "$NATIVE_PACKAGE_SET" = "post-intel" ]; then
+          require_package @opencoven/cli-macos-x64
+          require_package @opencoven/cli-macos
+          else
+          require_package @opencoven/cli-macos
+          fi
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
         if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
