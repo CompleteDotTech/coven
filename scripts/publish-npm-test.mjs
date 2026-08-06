@@ -807,6 +807,132 @@ test('release workflow fail-closes signed recovery tags', () => {
   );
 });
 
+test('release workflow preflights selected native package availability before publishing', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const jobStarts = [...workflow.matchAll(/^  [A-Za-z0-9_-]+:/gm)];
+  const publishJobStart = jobStarts.find((match) => match[0] === '  npm-publish:');
+  assert.ok(publishJobStart, 'npm-publish job must exist in release workflow');
+  const publishStart = publishJobStart.index;
+  const publishEnd =
+    jobStarts.find((match) => match.index > publishStart)?.index ?? workflow.length;
+  const publish = workflow.slice(publishStart, publishEnd);
+  const preflightStepMatch = publish.match(
+    /^      - name: Preflight npm native package availability$/m
+  );
+  assert.ok(preflightStepMatch, 'npm-publish must preflight selected native package records');
+  const preflightStart = preflightStepMatch.index;
+  const nativePublishCommands = [
+    'node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper',
+    'node scripts/publish-npm.mjs --target=windows --skip-build --publish --skip-wrapper',
+    'node scripts/publish-npm.mjs --target=macos-x64 --skip-build --publish --skip-wrapper',
+    'node scripts/publish-npm.mjs --target=macos --skip-build --publish --skip-wrapper'
+  ];
+  const nativePublishStarts = nativePublishCommands.map((command) => {
+    const nativePublishMatch = publish.match(
+      new RegExp(String.raw`^      - run: ${command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm')
+    );
+    assert.ok(nativePublishMatch, `npm-publish must contain ${command}`);
+    return nativePublishMatch.index;
+  });
+
+  const preflightEndStart = publish.indexOf('\n      - ', preflightStart + 1);
+  const preflightEnd = preflightEndStart === -1 ? publish.length : preflightEndStart;
+  const preflight = publish.slice(preflightStart, preflightEnd);
+  nativePublishStarts.forEach((nativePublishStart, index) => {
+    assert.ok(
+      preflightStart < nativePublishStart,
+      `native package availability preflight must run before ${nativePublishCommands[index]}`
+    );
+  });
+
+  assert.match(
+    preflight,
+    /^          RELEASE_MODE: \$\{\{ needs\.verify-tag\.outputs\.release_mode \}\}$/m
+  );
+  assert.match(
+    preflight,
+    /^          NATIVE_PACKAGE_SET: \$\{\{ needs\.verify-tag\.outputs\.native_package_set \}\}$/m
+  );
+  assert.match(
+    preflight,
+    /^          if output=\$\(npm view "\$package_name" name 2>&1\); then$/m
+  );
+  assert.match(preflight, /^          printf '%s\\n' "\$output"$/m);
+  assert.match(preflight, /^          if ! grep -q 'E404' <<<"\$output"; then$/m);
+  assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
+  assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
+  assert.match(
+    preflight,
+    /^          echo "::error::Package availability for \$package_name could not be verified; resolve the npm registry error before publishing\."$/m
+  );
+  assert.match(
+    preflight,
+    /^          echo "::error::Publish a bootstrap version for \$package_name, configure npm trusted publishing for OpenCoven\/coven and release-npm\.yml with no environment, then create a new signed recovery tag\. npm assigns latest to an initial public publish; do not publish the wrapper until recovery publishes the production package\."$/m
+  );
+
+  const normalBranchMatch = preflight.match(
+    /^          if \[ "\$RELEASE_MODE" = "normal" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
+  );
+  assert.ok(normalBranchMatch, 'preflight must contain the normal package-check branch');
+  const normalBranch = normalBranchMatch[0];
+  for (const packageName of [
+    '@opencoven/cli-linux-x64',
+    '@opencoven/cli-windows',
+    '@opencoven/cli-macos',
+    '@opencoven/cli-macos-x64'
+  ]) {
+    assert.match(
+      normalBranch,
+      new RegExp(
+        String.raw`^          require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`,
+        'm'
+      ),
+      `normal branch must require ${packageName}`
+    );
+  }
+
+  const postIntelBranchMatch = preflight.match(
+    /^          elif \[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
+  );
+  assert.ok(postIntelBranchMatch, 'preflight must contain the post-intel package-check branch');
+  const postIntelBranch = postIntelBranchMatch[0];
+  for (const packageName of ['@opencoven/cli-macos', '@opencoven/cli-macos-x64']) {
+    assert.match(
+      postIntelBranch,
+      new RegExp(
+        String.raw`^          require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`,
+        'm'
+      ),
+      `post-intel branch must require ${packageName}`
+    );
+  }
+
+  const preIntelBranchMatch = preflight.match(
+    /^          elif \[ "\$NATIVE_PACKAGE_SET" = "pre-intel" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
+  );
+  assert.ok(preIntelBranchMatch, 'preflight must contain the pre-intel package-check branch');
+  const preIntelBranch = preIntelBranchMatch[0];
+  assert.match(
+    preIntelBranch,
+    /^          require_package\b[^\n]*@opencoven\/cli-macos(?:\s|$)/m,
+    'pre-intel branch must require @opencoven/cli-macos'
+  );
+  const unsupportedBranchMatch = preflight.match(
+    /^          else\b[\s\S]*?(?=^          fi\b)/m
+  );
+  assert.ok(unsupportedBranchMatch, 'preflight must fail closed for unsupported package sets');
+  const unsupportedBranch = unsupportedBranchMatch[0];
+  assert.match(
+    unsupportedBranch,
+    /^          echo "::error::Unsupported recovery native package set \$NATIVE_PACKAGE_SET\."$/m
+  );
+  assert.match(unsupportedBranch, /^          exit 1$/m);
+});
+
 test('release workflow publishes only missing packages during recovery', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
@@ -955,6 +1081,10 @@ test('releasing guide documents signed partial-publish recovery', () => {
   assert.match(guide, /@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows/);
   assert.match(guide, /@opencoven\/cli-macos[\s\S]*@opencoven\/cli/);
   assert.match(guide, /@opencoven\/cli-macos-x64/);
+  assert.match(guide, /npm assigns `latest` to an initial public publish/);
+  assert.match(guide, /NPM_CONFIG_TAG=bootstrap/);
+  assert.match(guide, /npm trust github @opencoven\/cli-macos-x64/);
+  assert.match(guide, /v0\.2\.4-recovery\.1/);
   assert.match(guide, /npm trust github/);
 });
 

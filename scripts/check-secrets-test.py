@@ -239,6 +239,39 @@ class SecretGuardLockfileTests(unittest.TestCase):
 
         self.assertEqual(hits, [])
 
+    def test_opencoven_npm_package_spec_does_not_trigger_high_entropy(self) -> None:
+        text = "Publish `@opencoven/cli-macos-x64@0.0.0-bootstrap.1` under bootstrap."
+
+        hits = check_secrets.scan_text(
+            text, "docs/superpowers/specs/example.md"
+        )
+
+        self.assertEqual(hits, [])
+
+    def test_non_opencoven_npm_package_spec_still_triggers_high_entropy(self) -> None:
+        text = "Publish `@exampleorg/cli-macos-x64@0.0.0-bootstrap.1` under bootstrap."
+
+        hits = check_secrets.scan_text(
+            text, "docs/superpowers/specs/example.md"
+        )
+
+        self.assertEqual(
+            hits,
+            [("docs/superpowers/specs/example.md", 1, "high_entropy")],
+        )
+
+    def test_opencoven_package_spec_without_scope_prefix_still_triggers_high_entropy(self) -> None:
+        text = "Token `opencoven/cli-macos-x64@0.0.0-bootstrap.1` is not a scoped npm package."
+
+        hits = check_secrets.scan_text(
+            text, "docs/superpowers/specs/example.md"
+        )
+
+        self.assertEqual(
+            hits,
+            [("docs/superpowers/specs/example.md", 1, "high_entropy")],
+        )
+
     def test_repo_relative_path_heuristic_still_rejects_other_mixed_case_tokens(self) -> None:
         token = "OpenCoven/covenLikeFakePayloadMixedCase1234567890"
 

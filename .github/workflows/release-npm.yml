@@ -160,9 +160,13 @@ jobs:
               scripts/release-npm-platform-matrix.mjs|\
               scripts/publish-npm.mjs|\
               scripts/publish-npm-test.mjs|\
+              scripts/check-secrets.py|\
+              scripts/check-secrets-test.py|\
               docs/reference/releasing.md|\
               docs/superpowers/specs/2026-08-01-release-partial-publish-recovery-design.md|\
-              docs/superpowers/plans/2026-08-01-release-partial-publish-recovery.md)
+              docs/superpowers/plans/2026-08-01-release-partial-publish-recovery.md|\
+              docs/superpowers/specs/2026-08-06-v0.2.4-intel-macos-recovery-design.md|\
+              docs/superpowers/plans/2026-08-06-v0.2.4-intel-macos-recovery.md)
                 ;;
               *)
                 echo "::error::Refusing recovery: changed path $changed_path is not release-only."
@@ -346,6 +350,40 @@ jobs:
             exit 1
           fi
           expect_missing @opencoven/cli
+      - name: Preflight npm native package availability
+        env:
+          RELEASE_MODE: ${{ needs.verify-tag.outputs.release_mode }}
+          NATIVE_PACKAGE_SET: ${{ needs.verify-tag.outputs.native_package_set }}
+        run: |
+          set -euo pipefail
+          require_package() {
+          local package_name="$1"
+          local output
+          if output=$(npm view "$package_name" name 2>&1); then
+          return 0
+          fi
+          printf '%s\n' "$output"
+          if ! grep -q 'E404' <<<"$output"; then
+          echo "::error::Package availability for $package_name could not be verified; resolve the npm registry error before publishing."
+          exit 1
+          fi
+          echo "::error::Publish a bootstrap version for $package_name, configure npm trusted publishing for OpenCoven/coven and release-npm.yml with no environment, then create a new signed recovery tag. npm assigns latest to an initial public publish; do not publish the wrapper until recovery publishes the production package."
+          exit 1
+          }
+          if [ "$RELEASE_MODE" = "normal" ]; then
+          require_package @opencoven/cli-linux-x64
+          require_package @opencoven/cli-windows
+          require_package @opencoven/cli-macos-x64
+          require_package @opencoven/cli-macos
+          elif [ "$NATIVE_PACKAGE_SET" = "post-intel" ]; then
+          require_package @opencoven/cli-macos-x64
+          require_package @opencoven/cli-macos
+          elif [ "$NATIVE_PACKAGE_SET" = "pre-intel" ]; then
+          require_package @opencoven/cli-macos
+          else
+          echo "::error::Unsupported recovery native package set $NATIVE_PACKAGE_SET."
+          exit 1
+          fi
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
         if: needs.verify-tag.outputs.release_mode == 'normal'
         env:
