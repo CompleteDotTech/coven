@@ -859,12 +859,20 @@ test('release workflow preflights selected native package availability before pu
   );
   assert.match(
     preflight,
-    /^          if output=\$\(npm view "\$package_name" name\); then$/m
+    /^          if output=\$\(npm view "\$package_name" name 2>&1\); then$/m
   );
+  assert.match(preflight, /^          printf '%s\\n' "\$output"$/m);
+  assert.match(preflight, /^          if ! grep -q 'E404' <<<"\$output"; then$/m);
   assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
   assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
-  assert.match(preflight, /non-latest bootstrap version/);
-  assert.match(preflight, /release-npm\.yml/);
+  assert.match(
+    preflight,
+    /^          echo "::error::Package availability for \$package_name could not be verified; resolve the npm registry error before publishing\."$/m
+  );
+  assert.match(
+    preflight,
+    /^          echo "::error::Publish a non-latest bootstrap version for \$package_name, configure npm trusted publishing for OpenCoven\/coven and release-npm\.yml with no environment, then create a new signed recovery tag\."$/m
+  );
 
   const normalBranchMatch = preflight.match(
     /^          if \[ "\$RELEASE_MODE" = "normal" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m

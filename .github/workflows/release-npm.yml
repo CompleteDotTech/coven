@@ -357,11 +357,15 @@ jobs:
           require_package() {
           local package_name="$1"
           local output
-          if output=$(npm view "$package_name" name); then
+          if output=$(npm view "$package_name" name 2>&1); then
           return 0
           fi
           printf '%s\n' "$output"
-          echo "::error::Refusing non-latest bootstrap version publish in OpenCoven/coven release-npm.yml because npm package $package_name is unavailable."
+          if ! grep -q 'E404' <<<"$output"; then
+          echo "::error::Package availability for $package_name could not be verified; resolve the npm registry error before publishing."
+          exit 1
+          fi
+          echo "::error::Publish a non-latest bootstrap version for $package_name, configure npm trusted publishing for OpenCoven/coven and release-npm.yml with no environment, then create a new signed recovery tag."
           exit 1
           }
           if [ "$RELEASE_MODE" = "normal" ]; then
