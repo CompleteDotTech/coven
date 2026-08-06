@@ -807,6 +807,45 @@ test('release workflow fail-closes signed recovery tags', () => {
   );
 });
 
+test('release workflow preflights selected native package availability before publishing', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  const jobStarts = [...workflow.matchAll(/^  [A-Za-z0-9_-]+:/gm)];
+  const publishJobStart = jobStarts.find((match) => match[0] === '  npm-publish:');
+  assert.ok(publishJobStart, 'npm-publish job must exist in release workflow');
+  const publishStart = publishJobStart.index;
+  const publishEnd =
+    jobStarts.find((match) => match.index > publishStart)?.index ?? workflow.length;
+  const publish = workflow.slice(publishStart, publishEnd);
+  const preflightStart = publish.indexOf('name: Preflight npm native package availability');
+  const firstPublishStart = publish.indexOf(
+    'node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper'
+  );
+
+  assert.ok(preflightStart !== -1, 'npm-publish must preflight selected native package records');
+  assert.ok(firstPublishStart !== -1, 'npm-publish must contain its first native publish command');
+  assert.ok(
+    preflightStart < firstPublishStart,
+    'native package availability preflight must run before the first publish command'
+  );
+  const preflight = publish.slice(preflightStart, firstPublishStart);
+
+  assert.match(preflight, /RELEASE_MODE: \$\{\{ needs\.verify-tag\.outputs\.release_mode \}\}/);
+  assert.match(preflight, /NATIVE_PACKAGE_SET: \$\{\{ needs\.verify-tag\.outputs\.native_package_set \}\}/);
+  assert.match(preflight, /npm view "\$package_name" name/);
+  assert.match(preflight, /@opencoven\/cli-linux-x64/);
+  assert.match(preflight, /@opencoven\/cli-windows/);
+  assert.match(preflight, /@opencoven\/cli-macos/);
+  assert.match(preflight, /@opencoven\/cli-macos-x64/);
+  assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
+  assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
+  assert.match(preflight, /non-latest bootstrap version/);
+  assert.match(preflight, /release-npm\.yml/);
+});
+
 test('release workflow publishes only missing packages during recovery', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
@@ -898,44 +937,7 @@ test('release workflow publishes only missing packages during recovery', () => {
   );
 });
 
-test('release workflow preflights selected native package availability before publishing', () => {
-  const workflowPath = new URL(
-    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
-    import.meta.url
-  );
-  const workflow = readFileSync(workflowPath, 'utf8');
-  const jobStarts = [...workflow.matchAll(/^  [A-Za-z0-9_-]+:/gm)];
-  const publishJobStart = jobStarts.find((match) => match[0] === '  npm-publish:');
-  assert.ok(publishJobStart, 'npm-publish job must exist in release workflow');
-  const publishStart = publishJobStart.index;
-  const publishEnd =
-    jobStarts.find((match) => match.index > publishStart)?.index ?? workflow.length;
-  const publish = workflow.slice(publishStart, publishEnd);
-  const preflightStart = publish.indexOf('name: Preflight npm native package availability');
-  const firstPublishStart = publish.indexOf(
-    'node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper'
-  );
 
-  assert.ok(preflightStart !== -1, 'npm-publish must preflight selected native package records');
-  assert.ok(firstPublishStart !== -1, 'npm-publish must contain its first native publish command');
-  assert.ok(
-    preflightStart < firstPublishStart,
-    'native package availability preflight must run before the first publish command'
-  );
-  const preflight = publish.slice(preflightStart, firstPublishStart);
-
-  assert.match(preflight, /RELEASE_MODE: \$\{\{ needs\.verify-tag\.outputs\.release_mode \}\}/);
-  assert.match(preflight, /NATIVE_PACKAGE_SET: \$\{\{ needs\.verify-tag\.outputs\.native_package_set \}\}/);
-  assert.match(preflight, /npm view "\$package_name" name/);
-  assert.match(preflight, /@opencoven\/cli-linux-x64/);
-  assert.match(preflight, /@opencoven\/cli-windows/);
-  assert.match(preflight, /@opencoven\/cli-macos/);
-  assert.match(preflight, /@opencoven\/cli-macos-x64/);
-  assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
-  assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
-  assert.match(preflight, /non-latest bootstrap version/);
-  assert.match(preflight, /release-npm\.yml/);
-});
 
 test('release workflow triggers only on signed v* tag pushes (no workflow_dispatch fallback)', () => {
   const workflowPath = new URL(
