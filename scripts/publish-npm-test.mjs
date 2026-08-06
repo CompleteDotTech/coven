@@ -904,8 +904,13 @@ test('release workflow preflights selected native package availability before pu
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  const publishStart = workflow.indexOf('  npm-publish:');
-  const publish = workflow.slice(publishStart);
+  const jobStarts = [...workflow.matchAll(/^  [A-Za-z0-9_-]+:/gm)];
+  const publishJobStart = jobStarts.find((match) => match[0] === '  npm-publish:');
+  assert.ok(publishJobStart, 'npm-publish job must exist in release workflow');
+  const publishStart = publishJobStart.index;
+  const publishEnd =
+    jobStarts.find((match) => match.index > publishStart)?.index ?? workflow.length;
+  const publish = workflow.slice(publishStart, publishEnd);
   const preflightStart = publish.indexOf('name: Preflight npm native package availability');
   const firstPublishStart = publish.indexOf(
     'node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper'
