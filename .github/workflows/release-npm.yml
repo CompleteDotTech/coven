@@ -365,7 +365,7 @@ jobs:
           echo "::error::Package availability for $package_name could not be verified; resolve the npm registry error before publishing."
           exit 1
           fi
-          echo "::error::Publish a non-latest bootstrap version for $package_name, configure npm trusted publishing for OpenCoven/coven and release-npm.yml with no environment, then create a new signed recovery tag."
+          echo "::error::Publish a bootstrap version for $package_name, configure npm trusted publishing for OpenCoven/coven and release-npm.yml with no environment, then create a new signed recovery tag. npm assigns latest to an initial public publish; do not publish the wrapper until recovery publishes the production package."
           exit 1
           }
           if [ "$RELEASE_MODE" = "normal" ]; then

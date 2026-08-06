@@ -871,7 +871,7 @@ test('release workflow preflights selected native package availability before pu
   );
   assert.match(
     preflight,
-    /^          echo "::error::Publish a non-latest bootstrap version for \$package_name, configure npm trusted publishing for OpenCoven\/coven and release-npm\.yml with no environment, then create a new signed recovery tag\."$/m
+    /^          echo "::error::Publish a bootstrap version for \$package_name, configure npm trusted publishing for OpenCoven\/coven and release-npm\.yml with no environment, then create a new signed recovery tag\. npm assigns latest to an initial public publish; do not publish the wrapper until recovery publishes the production package\."$/m
   );
 
   const normalBranchMatch = preflight.match(
@@ -1073,7 +1073,7 @@ test('releasing guide documents signed partial-publish recovery', () => {
   assert.match(guide, /@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows/);
   assert.match(guide, /@opencoven\/cli-macos[\s\S]*@opencoven\/cli/);
   assert.match(guide, /@opencoven\/cli-macos-x64/);
-  assert.match(guide, /non-latest bootstrap version/);
+  assert.match(guide, /npm assigns `latest` to an initial public publish/);
   assert.match(guide, /NPM_CONFIG_TAG=bootstrap/);
   assert.match(guide, /npm trust github @opencoven\/cli-macos-x64/);
   assert.match(guide, /v0\.2\.4-recovery\.1/);

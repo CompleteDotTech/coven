@@ -16,7 +16,7 @@ Source package versions stay `0.0.0` in the repo. The published version comes fr
 
 ### Bootstrap a new native package
 
-Trusted publisher configuration is scoped to an existing npm package record. When a new native package such as `@opencoven/cli-macos-x64` has never been published, create that record first with a short-lived, package-scoped credential under a non-latest bootstrap version so normal users never receive the bootstrap artifact from `latest`.
+Trusted publisher configuration is scoped to an existing npm package record. When a new native package such as `@opencoven/cli-macos-x64` has never been published, create that record first with a short-lived, package-scoped credential under a bootstrap version. npm assigns `latest` to an initial public publish even when the `bootstrap` dist-tag is requested, so complete the trusted-publisher setup and recovery before publishing a wrapper that can select the bootstrap artifact.
 
 Build the Intel macOS binary from the audited recovery checkout, then publish only the bootstrap artifact:
 
@@ -27,7 +27,7 @@ NODE_AUTH_TOKEN="$NPM_GRANULAR_TOKEN" \
 node scripts/publish-npm.mjs --target=macos-x64 --skip-build --publish --skip-wrapper
 ```
 
-This only creates the npm package record. Do not publish a production version, do not move `latest`, and revoke the temporary credential immediately after the bootstrap publish succeeds.
+This only creates the npm package record. Do not publish a production version or publish the wrapper before recovery replaces the bootstrap artifact with the OIDC-published production version, and revoke the temporary credential immediately after the bootstrap publish succeeds.
 
 After every package already has an npm record, configure trusted publishing for every package. With npm 11.16 or newer, an authenticated publisher can configure it from the CLI:
 
