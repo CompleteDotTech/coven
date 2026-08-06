@@ -867,7 +867,7 @@ test('release workflow preflights selected native package availability before pu
   assert.match(preflight, /release-npm\.yml/);
 
   const normalBranchMatch = preflight.match(
-    /\[ "\$RELEASE_MODE" = "normal" \][\s\S]*?(?=\n\s*(?:elif|else|fi)\b)/
+    /^          if \[ "\$RELEASE_MODE" = "normal" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
   );
   assert.ok(normalBranchMatch, 'preflight must contain the normal package-check branch');
   const normalBranch = normalBranchMatch[0];
@@ -888,7 +888,7 @@ test('release workflow preflights selected native package availability before pu
   }
 
   const postIntelBranchMatch = preflight.match(
-    /elif \[ "\$NATIVE_PACKAGE_SET" = "post-intel" \][\s\S]*?(?=\n\s*(?:elif|else|fi)\b)/
+    /^          elif \[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
   );
   assert.ok(postIntelBranchMatch, 'preflight must contain the post-intel package-check branch');
   const postIntelBranch = postIntelBranchMatch[0];
@@ -902,6 +902,17 @@ test('release workflow preflights selected native package availability before pu
       `post-intel branch must require ${packageName}`
     );
   }
+
+  const preIntelElseBranchMatch = preflight.match(
+    /^          else\b[\s\S]*?(?=^          fi\b)/m
+  );
+  assert.ok(preIntelElseBranchMatch, 'preflight must contain the top-level pre-Intel else branch');
+  const preIntelElseBranch = preIntelElseBranchMatch[0];
+  assert.match(
+    preIntelElseBranch,
+    /^          require_package\b[^\n]*@opencoven\/cli-macos(?:\s|$)/m,
+    'pre-Intel else branch must require @opencoven/cli-macos'
+  );
 });
 
 test('release workflow publishes only missing packages during recovery', () => {
