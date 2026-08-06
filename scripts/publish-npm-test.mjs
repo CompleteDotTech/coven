@@ -1073,6 +1073,10 @@ test('releasing guide documents signed partial-publish recovery', () => {
   assert.match(guide, /@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows/);
   assert.match(guide, /@opencoven\/cli-macos[\s\S]*@opencoven\/cli/);
   assert.match(guide, /@opencoven\/cli-macos-x64/);
+  assert.match(guide, /non-latest bootstrap version/);
+  assert.match(guide, /NPM_CONFIG_TAG=bootstrap/);
+  assert.match(guide, /npm trust github @opencoven\/cli-macos-x64/);
+  assert.match(guide, /v0\.2\.4-recovery\.1/);
   assert.match(guide, /npm trust github/);
 });
 

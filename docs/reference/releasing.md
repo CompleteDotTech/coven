@@ -14,7 +14,22 @@ Source package versions stay `0.0.0` in the repo. The published version comes fr
 
 ## One-time setup (per package, per fresh npm publisher)
 
-Before the first OIDC release, configure trusted publishing for every package. With npm 11.16 or newer, an authenticated publisher can configure it from the CLI:
+### Bootstrap a new native package
+
+Trusted publisher configuration is scoped to an existing npm package record. When a new native package such as `@opencoven/cli-macos-x64` has never been published, create that record first with a short-lived, package-scoped credential under a non-latest bootstrap version so normal users never receive the bootstrap artifact from `latest`.
+
+Build the Intel macOS binary from the audited recovery checkout, then publish only the bootstrap artifact:
+
+```bash
+NPM_CONFIG_TAG=bootstrap \
+COVEN_NPM_VERSION=0.0.0-bootstrap.1 \
+NODE_AUTH_TOKEN="$NPM_GRANULAR_TOKEN" \
+node scripts/publish-npm.mjs --target=macos-x64 --skip-build --publish --skip-wrapper
+```
+
+This only creates the npm package record. Do not publish a production version, do not move `latest`, and revoke the temporary credential immediately after the bootstrap publish succeeds.
+
+After every package already has an npm record, configure trusted publishing for every package. With npm 11.16 or newer, an authenticated publisher can configure it from the CLI:
 
 ```sh
 npm trust github @opencoven/cli --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
@@ -24,7 +39,11 @@ npm trust github @opencoven/cli-linux-x64 --repository OpenCoven/coven --file re
 npm trust github @opencoven/cli-windows --repository OpenCoven/coven --file release-npm.yml --allow-publish --yes
 ```
 
-Leave the environment unset. Verify the result with `npm trust list <package>`.
+Leave the environment unset (`no environment`). Each package should list `OpenCoven/coven` as the source repository and `release-npm.yml` as the workflow file. Verify the result with `npm trust list <package>`; for example:
+
+```sh
+npm trust list @opencoven/cli-macos-x64
+```
 
 The npm website exposes the same configuration:
 
@@ -117,7 +136,7 @@ The recovery path exists only for one exact registry state per supported histori
 - `@opencoven/cli-macos@X.Y.Z` and `@opencoven/cli@X.Y.Z` do not exist.
 - If the original release wrapper declares the post-Intel set, `@opencoven/cli-macos-x64@X.Y.Z` also does not exist. The workflow rejects incomplete, unexpected, or mixed package sets.
 
-Fix the trusted-publisher configuration on a temporary recovery branch created from the original release tag. Then create a **new signed recovery tag** whose commit descends from that tag. The workflow requires the original tag to be an ancestor and every intervening changed path to be on its release-only allowlist; unlike normal releases, recovery tags do not need to include unrelated later `main` commits.
+Fix the trusted-publisher configuration on a temporary recovery branch created from the original release tag. For the `v0.2.4` recovery, bootstrap `@opencoven/cli-macos-x64` as above and configure trusted publishing for it before pushing `v0.2.4-recovery.1`. Then create a **new signed recovery tag** whose commit descends from that tag. The workflow requires the original tag to be an ancestor and every intervening changed path to be on its release-only allowlist; unlike normal releases, recovery tags do not need to include unrelated later `main` commits.
 
 ```sh
 git fetch origin --tags
@@ -129,7 +148,7 @@ git push origin release/vX.Y.Z-recovery.N vX.Y.Z-recovery.N
 
 Never move or reuse the original release tag or a recovery tag. Increment `N` if a later, separately-reviewed recovery attempt is required.
 
-Before publishing, the recovery workflow verifies both signed tags, ancestry, the changed-path allowlist, the original wrapper's complete package set, and the exact npm registry state above. It then skips the already-published Linux and Windows packages and publishes the missing macOS package or packages before the wrapper through OIDC with provenance.
+Before publishing, the recovery workflow verifies both signed tags, ancestry, the changed-path allowlist, the original wrapper's complete package set, and the exact npm registry state above. It then skips the already-published Linux and Windows packages and publishes the missing macOS package or packages before the wrapper, producing the real `0.2.4` release through GitHub OIDC with provenance.
 
 ## Recovering from a refused release
 
