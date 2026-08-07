@@ -17,7 +17,7 @@ Launch, observe, attach, and coordinate agent work through one neutral runtime s
 | 🌐 **Ecosystem**                                      | 💬 **Community**                            | 🛠️ **Development**                                             |
 | :---------------------------------------------------- | :------------------------------------------ | :------------------------------------------------------------- |
 | [**Website**](https://opencoven.ai/)                  | [**Discord**](https://discord.gg/opencoven) | [**GitHub Issues**](https://github.com/OpenCoven/coven/issues) |
-| [**Documentation**](https://docs.opencoven.ai/)       | [**X (\@OpenCvn)**](https://x.com/OpenCvn)  | [**Public Roadmap**](docs/ROADMAP.md)                          |
+| [**Documentation**](https://docs.opencoven.ai/)       | [**X (\@OpenCvn)**](https://x.com/OpenCvn)  | [**Public Roadmap**](https://docs.opencoven.ai/roadmap)        |
 | [**Submit Feedback**](https://feedback.opencoven.ai/) |                                             | [**Contributing**](CONTRIBUTING.md)                            |
 
 ---
@@ -419,7 +419,7 @@ coven/
 ├── crates/
 │   ├── coven-cli/              # Main Rust binary — the `coven` command
 │   └── coven-relay/            # Internal relay crate
-├── docs/                       # Full documentation suite (see Documentation section)
+├── docs/                       # Code-adjacent docs (canonical public suite: docs.opencoven.ai)
 ├── npm/                        # npm wrapper package source for @opencoven/cli
 ├── packages/
 │   └── openclaw-coven/         # External OpenClaw bridge plugin (@opencoven/coven)
@@ -441,7 +441,7 @@ coven/
 - **`crates/coven-cli`** — Everything that becomes the `coven` binary. This is where daemon, PTY adapter, session store, local IPC API, and CLI surface live in Rust.
 - **`packages/openclaw-coven`** — The opt-in bridge between OpenClaw and Coven. Lives here (not in OpenClaw core) to keep the trust boundary clean. Published as `@opencoven/coven`.
 - **`scripts/check-secrets.py`** — Required pre-release and pre-PR scan. Run it before pushing to avoid leaking credentials into git history.
-- **`docs/`** — The canonical documentation suite. All product docs, architecture, API contract, safety model, and roadmap live here.
+- **`docs/`** — Code-adjacent documentation kept beside the source it describes (normative contracts, plans/specs, repo policy, and command-adjacent reference). The canonical public documentation suite lives at [docs.opencoven.ai](https://docs.opencoven.ai/) (source: [OpenCoven/coven-docs](https://github.com/OpenCoven/coven-docs)).
 
 ---
 
@@ -509,6 +509,13 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 ---
 
 ## Documentation
+
+The canonical public documentation suite lives at
+[docs.opencoven.ai](https://docs.opencoven.ai/) (source:
+[OpenCoven/coven-docs](https://github.com/OpenCoven/coven-docs)). The pages
+below are code-adjacent docs kept in this repository beside the source they
+describe — normative contracts, plans/specs, repo policy, and
+command-adjacent reference.
 
 | Document                                                | What it covers                                                        |
 | ------------------------------------------------------- | --------------------------------------------------------------------- |
@@ -828,8 +835,8 @@ MIT © Valentina Alexander and the OpenCoven contributors — see [LICENSE](LICE
 | 💬 Discord              | [discord.gg/opencoven](https://discord.gg/opencoven)       |
 | 🐦 X / Twitter          | [@OpenCvn](https://x.com/OpenCvn)                          |
 | 🐛 Issues & Bug Reports | [GitHub Issues](https://github.com/OpenCoven/coven/issues) |
-| 📖 Documentation        | [`docs/` directory](docs/)                                 |
-| 🗺️ Public Roadmap       | [docs/ROADMAP.md](docs/ROADMAP.md)                         |
+| 📖 Documentation        | [docs.opencoven.ai](https://docs.opencoven.ai/)            |
+| 🗺️ Public Roadmap       | [docs.opencoven.ai/roadmap](https://docs.opencoven.ai/roadmap) |
 
 ---
 

@@ -1,20 +1,26 @@
 ---
-title: "Coven documentation maintenance and public-docs rules"
-description: "Maintenance rules for the public Coven docs: safe examples, canonical names, what to keep private, when to update pages, and how to handle stale content."
+title: "Coven documentation maintenance and code-adjacent docs rules"
+description: "Maintenance rules for the code-adjacent Coven docs in this repository: what stays here vs. the canonical coven-docs site, safe examples, canonical names, what to keep private, when to update pages, and how to handle stale content."
 ---
 
 # Documentation Maintenance
 
-These rules keep the public docs useful, accurate, and free of private material.
+These rules keep the docs in this repository useful, accurate, and free of private material.
 
-## Public docs stance
+## Canonical source vs. code-adjacent docs
 
-Docs in this repository are public product docs. They should describe OpenCoven and Coven without depending on private workspaces, private chats, private infrastructure, or unreleased assumptions.
+The **canonical public documentation suite** is [coven-docs](https://github.com/OpenCoven/coven-docs), published at [docs.opencoven.ai](https://docs.opencoven.ai/). Public product guides, concepts, and reference belong there.
+
+Docs in this repository are **code-adjacent**: they are kept beside the source they describe so they can change in lockstep with it. That includes normative contracts (`API-CONTRACT.md`, `ENGINE-CONTRACT.md`, `reference/api-contract.md`), repo policy, plans/specs (`superpowers/plans/`, `superpowers/specs/`), package-adjacent reference, and this maintenance guide. Do not describe the local `docs/` tree as the canonical public documentation suite.
+
+When public product content is migrated to coven-docs, replace the local page with a link to the canonical site — but do not remove a local page until the equivalent content exists canonically upstream.
+
+Whether a doc lives here or in coven-docs, it must describe OpenCoven and Coven without depending on private workspaces, private chats, private infrastructure, or unreleased assumptions.
 
 Use examples that are safe to publish:
 
 - `/path/to/project`
-- `/Users/example/.coven/coven.sock`
+- `~/.coven/coven.sock`
 - `session-1`
 - `intent-1`
 - `https://github.com/OpenCoven/coven`
