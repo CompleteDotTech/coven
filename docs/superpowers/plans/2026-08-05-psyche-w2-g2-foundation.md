@@ -4,6 +4,8 @@
 
 **Goal:** Finish Psyche W2 and produce terminal G2 evidence for canonical versioned records, durable SQLite migrations, behavior-level fake boundaries, and migration/state-machine/property/crash tests.
 
+**Termination persistence design:** [`../specs/2026-08-07-psyche-g2-atomic-termination-persistence-design.md`](../specs/2026-08-07-psyche-g2-atomic-termination-persistence-design.md)
+
 **Architecture:** Extend the merged four-crate bootstrap with the focused crates named by the canonical architecture. `psyche-core` owns policy-free identifiers, digests, schema names, and minimum record shapes; `psyche-store` owns SQLite, migrations, immutable records, append-only execution-binding revisions and transitions, quarantine, retention, and its package-local crash helper; `psyche-coven` and `psyche-surfaces` own behavior-level traits for their respective boundaries; `psyche-test-support` owns deterministic scripted fakes and reusable conformance fixtures. `psyche-runtime` remains the only composition root. W3-W9 retain identity resolution, graph admission, orchestration policy, real Coven integration, Telegram behavior, verification, and add-on trust.
 
 **Tech Stack:** Rust 2024 on 1.85, serde/serde_json, RFC 8785 JSON canonicalization, SHA-256, ULID, rusqlite with bundled SQLite, Tokio, proptest, tempfile, assert_cmd, cargo-deny, gitleaks.
@@ -2872,7 +2874,7 @@ async fn unknown_contract_fails_before_adoption() {
 }
 
 #[tokio::test]
-async fn termination_dispatch_appends_validated_outcome_before_returning() {
+async fn termination_dispatch_persists_acknowledged_outcome_before_success() {
     // Seed revision 1 (session-bound) and the derived TerminationRequested
     // revision 2, then dispatch. `persist_then_terminate` must validate the
     // port's evidence, derive revision 3, and durably append it before it
@@ -3116,6 +3118,11 @@ impl TerminationRequest {
     pub fn reason_code(&self) -> &str { &self.reason_code }
 }
 
+pub enum TerminationPersistenceFailure<E> {
+    Conflict(E),
+    Write(E),
+}
+
 pub trait TerminationPersistence {
     type Error;
 
@@ -3124,7 +3131,7 @@ pub trait TerminationPersistence {
     fn persist_requested(
         &mut self,
         requested: ExecutionBinding,
-    ) -> Result<Vec<u8>, Self::Error>;
+    ) -> Result<Vec<u8>, TerminationPersistenceFailure<Self::Error>>;
 
     /// Durably appends the next digest-linked `ExecutionBinding` revision that
     /// carries the validated acknowledged/unresolved outcome, returning only
@@ -3138,19 +3145,21 @@ pub trait TerminationPersistence {
     /// parsed `ExecutionBinding`, so the coordinator can prove byte-exact
     /// durability before returning any disposition. An exact idempotent replay
     /// of the same next revision returns the same bytes; every other divergence
-    /// propagates the store error.
+    /// returns the corresponding typed conflict or write failure.
     fn persist_outcome(
         &mut self,
         outcome: ExecutionBinding,
-    ) -> Result<Vec<u8>, Self::Error>;
+    ) -> Result<Vec<u8>, TerminationPersistenceFailure<Self::Error>>;
 }
 
 pub enum TerminationDispatchError<E> {
     Contract(ContractError),
-    Persistence(E),
+    RequestPersistence(E),
     PersistedBindingMismatch,
     Port(PortError),
     OutcomeEvidenceMismatch,
+    OutcomePersistenceIndeterminate(E),
+    RevisionConflict(E),
     PersistedOutcomeMismatch,
 }
 
@@ -3169,7 +3178,12 @@ where
         .map_err(TerminationDispatchError::Contract)?;
     let persisted_bytes = persistence
         .persist_requested(requested.clone())
-        .map_err(TerminationDispatchError::Persistence)?;
+        .map_err(|failure| match failure {
+            TerminationPersistenceFailure::Conflict(error) =>
+                TerminationDispatchError::RevisionConflict(error),
+            TerminationPersistenceFailure::Write(error) =>
+                TerminationDispatchError::RequestPersistence(error),
+        })?;
     if persisted_bytes != expected_bytes {
         return Err(TerminationDispatchError::PersistedBindingMismatch);
     }
@@ -3189,7 +3203,12 @@ where
         .map_err(TerminationDispatchError::Contract)?;
     let persisted_outcome_bytes = persistence
         .persist_outcome(outcome)
-        .map_err(TerminationDispatchError::Persistence)?;
+        .map_err(|failure| match failure {
+            TerminationPersistenceFailure::Conflict(error) =>
+                TerminationDispatchError::RevisionConflict(error),
+            TerminationPersistenceFailure::Write(error) =>
+                TerminationDispatchError::OutcomePersistenceIndeterminate(error),
+        })?;
     if persisted_outcome_bytes != expected_outcome_bytes {
         return Err(TerminationDispatchError::PersistedOutcomeMismatch);
     }
@@ -3339,12 +3358,25 @@ derives the next digest-linked revision. Mismatched or invalid evidence returns
 that exact next revision durably and return its committed RFC 8785 canonical
 bytes; the coordinator compares them byte-for-byte with
 `canonical_bytes(&outcome)` and fails closed as `PersistedOutcomeMismatch` on
-any divergence. A persistence failure propagates and the disposition is not
-returned. Because the outcome append occurs before the coordinator returns
+any divergence. A requested-revision write failure is
+`RequestPersistence`; an outcome write failure after Coven has responded is
+`OutcomePersistenceIndeterminate`; and a changed replay, fork, gap, or
+intervening revision is `RevisionConflict`. None returns the disposition.
+Because the outcome append occurs before the coordinator returns
 `Ok(disposition)`, a returned success can never lack durable evidence, and the
 `persist_outcome` predecessor-digest check makes a concurrent intervening
-revision fail as a fork/gap rather than forking the chain. On restart, replaying
-the same outcome revision is idempotent and yields the same durable disposition.
+revision fail rather than forking the chain.
+
+Startup reconciliation treats a durable `TerminationRequested` tip as
+incomplete work. It reconstructs the same construction-closed request, replays
+`CovenPort::terminate` with the persisted termination request ID as the stable
+idempotency identity, validates the stable response, and appends the missing
+outcome. This covers crashes after the requested append, after the port
+response, and before the outcome append. A crash after the outcome commit but
+before the caller observes success is an exact idempotent replay. A different
+response under the same termination identity is `RevisionConflict`; recovery
+never silently rebases, replaces an existing successor, or invents a successful
+outcome.
 
 The W2 real-store test wrapper implements `TerminationPersistence` — both
 `persist_requested` and `persist_outcome` — by calling
@@ -3356,7 +3388,10 @@ revision as the outcome revision's predecessor and refuses to insert unless its
 session/termination fields match that predecessor. Each method computes the
 candidate's canonical bytes before insertion
 and returns that byte vector only after `insert` has either committed those
-exact bytes or proved an exact idempotent replay; every `StoreError` propagates.
+exact bytes or proved an exact idempotent replay. The wrapper classifies a
+changed same-revision replay, fork, gap, historical rewrite, or intervening
+successor as `TerminationPersistenceFailure::Conflict`; all other store/write
+failures are `TerminationPersistenceFailure::Write`.
 The predecessor digest makes a concurrent intervening revision fail as a
 fork/gap rather than turning the precheck into a TOCTOU bypass. Neither method
 returns a success-shaped fallback. This preserves the dependency direction
@@ -3401,30 +3436,47 @@ timestamp instant; every case requires zero port calls and no new binding
 revision. The reusable assertion is part of the fake/real conformance contract
 that W5 must run unchanged.
 
-Name the outcome-durability ordering test
-`termination_dispatch_appends_validated_outcome_before_returning`. It seeds a
-session-bound revision 1 and the derived `TerminationRequested` revision 2, then
-runs one acknowledged and one unresolved case end to end: `FakeCoven::terminate`
-returns valid `CancellationAcknowledgementEvidence` (respectively
-`CancellationUnresolvedEvidence`) bound to the persisted correlation, and after
-`persist_then_terminate` returns `Ok`, the test reopens the SQLite file and
-asserts that revision 3 is durable, byte-exact against `canonical_bytes` of the
-derived outcome revision, digest-linked to revision 2, and carrying the same
-frozen session and immutable execution correlation; the returned disposition
-equals the port's evidence. Its negative cases independently use evidence whose
-termination request ID, session, execution correlation, or authority-evidence
-digest does not match the persisted request (each expecting
-`OutcomeEvidenceMismatch`), an acknowledgement timestamp outside the persisted
-termination window, an injected `persist_outcome` failure, a `persist_outcome`
-returning different bytes for a structurally equal timestamp instant (expecting
-`PersistedOutcomeMismatch`), and a concurrent intervening revision 3 committed
-by another writer before the append (expecting the append to fail as a fork/gap
-via the predecessor-digest check); every negative case leaves no revision 3 and
-returns an error rather than `Ok`. A replay/restart case reopens the store after
-a committed outcome, re-runs the same disposition, and asserts the idempotent
-append yields the same durable revision 3 with no duplicate or fork. This
-reusable assertion is also part of the fake/real conformance contract that W5
-must run unchanged.
+Use separate exact outcome-coordinator tests so the evidence manifest cannot
+hide a missing recovery or conflict case behind one broad test:
+
+- `termination_dispatch_persists_acknowledged_outcome_before_success`;
+- `termination_dispatch_persists_unresolved_outcome_before_success`;
+- `termination_dispatch_exact_replay_is_idempotent`;
+- `termination_dispatch_crash_after_response_leaves_recoverable_request`;
+- `termination_dispatch_restart_recovers_missing_outcome`;
+- `termination_dispatch_rejects_conflicting_replay_response`;
+- `termination_dispatch_rejects_invalid_outcome_evidence`;
+- `termination_dispatch_reports_indeterminate_outcome_persistence`;
+- `termination_dispatch_rejects_concurrent_intervening_revision`; and
+- `termination_dispatch_rejects_outcome_byte_attestation_mismatch`.
+
+The acknowledged and unresolved tests seed a session-bound revision 1 and the
+derived `TerminationRequested` revision 2, then run the public coordinator end
+to end. After `persist_then_terminate` returns `Ok`, each test reopens the
+SQLite file and asserts revision 3 is durable, byte-exact against
+`canonical_bytes` of the derived outcome, digest-linked to revision 2, and
+carries the same frozen session and immutable execution correlation. Exact
+replay reopens the store and proves the same disposition produces no duplicate
+or fork.
+
+The crash test uses a deterministic test-support fault point after the valid
+port response and before `persist_outcome`, then reopens the store and proves
+the requested revision is durable while no outcome exists. The restart test
+creates a fresh coordinator over that state, scripts the same response for the
+same idempotency identity, and proves the missing outcome is committed before
+success. A different replay response must return `RevisionConflict` without
+mutation.
+
+The invalid-evidence test independently changes the termination request ID,
+session, execution correlation, authority-evidence digest, and acknowledgement
+timestamp. The persistence test injects an outcome write failure and expects
+`OutcomePersistenceIndeterminate`. The concurrency test commits an intervening
+revision 3 before append and expects `RevisionConflict`. The byte-attestation
+test returns different committed bytes for a structurally equal timestamp
+instant and expects `PersistedOutcomeMismatch`. Every negative test reopens the
+store, proves no illegal terminal revision was appended, and proves no
+success-shaped result escaped. These reusable assertions are part of the
+fake/real conformance contract that W5 must run unchanged.
 
 Add a strict canonical `tests/fixtures/result-bundle.json` containing one
 primary `application/json` result and one `text/plain` artifact. In
@@ -4501,7 +4553,16 @@ Use this complete manifest shape:
       "tests": [
         "advertised_adoption_requires_a_scripted_adoption_step",
         "termination_dispatch_requires_durable_session_bound_revision",
-        "termination_dispatch_appends_validated_outcome_before_returning"
+        "termination_dispatch_persists_acknowledged_outcome_before_success",
+        "termination_dispatch_persists_unresolved_outcome_before_success",
+        "termination_dispatch_exact_replay_is_idempotent",
+        "termination_dispatch_crash_after_response_leaves_recoverable_request",
+        "termination_dispatch_restart_recovers_missing_outcome",
+        "termination_dispatch_rejects_conflicting_replay_response",
+        "termination_dispatch_rejects_invalid_outcome_evidence",
+        "termination_dispatch_reports_indeterminate_outcome_persistence",
+        "termination_dispatch_rejects_concurrent_intervening_revision",
+        "termination_dispatch_rejects_outcome_byte_attestation_mismatch"
       ]
     },
     "psyche-test-support/state_machine": {
@@ -4655,7 +4716,7 @@ including why `ExpectedUnsupported` is diagnostic rather than passed evidence.
 | Migrations | `cargo test -p psyche-store --test migrations -- --exact fresh_store_applies_v1_once_and_reopens` | not run remotely | none |
 | State-machine/property | `cargo test -p psyche-test-support --test state_machine -- --exact model_and_store_agree_after_any_foundation_operation_sequence` | not run remotely | none |
 | Crash/restart | `cargo test -p psyche-store --features test-fault-injection --test crash -- --exact killed_writer_exposes_only_committed_state_after_reopen` | not run remotely | none |
-| Fake boundaries and durable termination ordering | `cargo test -p psyche-test-support --test fakes -- --exact advertised_adoption_requires_a_scripted_adoption_step && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_requires_durable_session_bound_revision && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_appends_validated_outcome_before_returning` | not run remotely | none |
+| Fake boundaries and durable termination ordering | `cargo test -p psyche-test-support --test fakes -- --exact advertised_adoption_requires_a_scripted_adoption_step && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_requires_durable_session_bound_revision && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_persists_acknowledged_outcome_before_success && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_persists_unresolved_outcome_before_success && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_exact_replay_is_idempotent && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_crash_after_response_leaves_recoverable_request && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_restart_recovers_missing_outcome && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_rejects_conflicting_replay_response && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_rejects_invalid_outcome_evidence && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_reports_indeterminate_outcome_persistence && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_rejects_concurrent_intervening_revision && cargo test -p psyche-test-support --test fakes -- --exact termination_dispatch_rejects_outcome_byte_attestation_mismatch` | not run remotely | none |
 | Execution request RFC3339 golden bytes | `cargo test -p psyche-coven --test request_digest -- --exact execution_request_launch_matches_golden_bytes_and_digest && cargo test -p psyche-coven --test request_digest -- --exact execution_request_input_matches_golden_bytes_and_digest` | not run remotely | none |
 | Validated termination dispatch | `cargo test -p psyche-coven --test bindings -- --exact termination_dispatch_rejects_invalid_request_before_persistence` | not run remotely | none |
 | G2 cancellation-state vocabulary | `cargo test -p psyche-core --test contracts -- --exact cancellation_state_vocabulary_requires_matching_o5_evidence` | not run remotely | none |
