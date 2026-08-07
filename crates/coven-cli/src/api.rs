@@ -235,6 +235,22 @@ pub trait SessionRuntime {
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 
+    /// Persist a direct live-session event (`input`, `kill`, `cast`) through the
+    /// daemon's shared `EventWriter` when one is available, returning
+    /// `Some(result)`. Routing these events through the writer flushes any
+    /// pending output-truncation marker *before* the event, so a truncation
+    /// episode can never be recorded after a boundary event that should have
+    /// closed it (issue #642). Runtimes without a writer return `None`, and the
+    /// caller falls back to a direct `store::insert_event`.
+    fn record_session_event(
+        &self,
+        _session_id: &str,
+        _kind: &str,
+        _payload: &Value,
+    ) -> Option<Result<()>> {
+        None
+    }
+
     fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
         None
     }
@@ -377,7 +393,7 @@ pub fn handle_request_with_runtime(
             let (status, response) = control_plane::route_action(payload);
             json_response(status, &response)
         }
-        ("POST", "/cast") => submit_cast(coven_home, body),
+        ("POST", "/cast") => submit_cast(coven_home, body, runtime),
         ("GET", "/cast-codes") => cast_codes_response(),
         // Filesystem-backed reads under ~/.coven/. Missing files return [].
         ("GET", "/familiars") => {
@@ -2043,10 +2059,7 @@ fn emit_handoff(coven_home: &Path, session_id: &str, body: Option<&str>) -> Resu
         return session_not_live_response(session_id);
     }
     let workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
-    let event_cursor = store::list_events(&conn, session_id)?
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or(0);
+    let event_cursor = store::max_event_seq(&conn, session_id)?;
     let now = current_timestamp();
     let record = store::create_handoff(
         &mut conn,
@@ -2118,10 +2131,7 @@ fn claim_session_handoff(coven_home: &Path, path: &str, body: Option<&str>) -> R
     let source_workspace: WorkspaceSnapshot = serde_json::from_str(&handoff.workspace_json)
         .context("stored handoff workspace snapshot is invalid")?;
     let current_workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
-    let current_cursor = store::list_events(&conn, session_id)?
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or(0);
+    let current_cursor = store::max_event_seq(&conn, session_id)?;
     if current_cursor != handoff.event_cursor {
         return api_error(
             409,
@@ -2182,10 +2192,7 @@ fn acknowledge_session_handoff(
     if handoff.session_id != session_id {
         return api_error(404, "handoff_not_found", "Handoff was not found.", None);
     }
-    let current_cursor = store::list_events(&conn, session_id)?
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or(0);
+    let current_cursor = store::max_event_seq(&conn, session_id)?;
     if current_cursor != handoff.event_cursor {
         return api_error(
             409,
@@ -2555,7 +2562,7 @@ fn record_input(
             )
         }
     } else {
-        insert_event(&conn, coven_home, session_id, "input", payload)?;
+        record_direct_session_event(runtime, &conn, coven_home, session_id, "input", payload)?;
         json_response(202, &json!({ "ok": true, "accepted": true }))
     };
     store::release_session_input_lease(&conn, &lease_id)?;
@@ -2607,7 +2614,8 @@ fn kill_session(
     }
     let now = current_timestamp();
     store::update_session_status(&conn, session_id, "killed", None, &now)?;
-    insert_event(
+    record_direct_session_event(
+        runtime,
         &conn,
         coven_home,
         session_id,
@@ -2798,7 +2806,11 @@ fn cast_codes_response() -> Result<ApiResponse> {
     json_response(200, &codes)
 }
 
-fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+fn submit_cast(
+    coven_home: &Path,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
     let payload = match parse_body(body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -2834,7 +2846,8 @@ fn submit_cast(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
             Some(json!({ "sessionId": session_id })),
         );
     }
-    insert_event(
+    record_direct_session_event(
+        runtime,
         &conn,
         coven_home,
         session_id,
@@ -3086,6 +3099,25 @@ fn insert_event(
             created_at: current_timestamp(),
         },
     )
+}
+
+/// Persist a direct live-session event, preferring the daemon's shared
+/// `EventWriter` so any pending output-truncation marker is flushed ahead of the
+/// event (issue #642). When the runtime owns no writer (tests, non-live paths),
+/// fall back to a direct insert — behavior is otherwise identical because both
+/// paths persist through `store::insert_event_with_privacy`.
+fn record_direct_session_event(
+    runtime: &dyn SessionRuntime,
+    conn: &rusqlite::Connection,
+    coven_home: &Path,
+    session_id: &str,
+    kind: &str,
+    payload: Value,
+) -> Result<()> {
+    match runtime.record_session_event(session_id, kind, &payload) {
+        Some(result) => result,
+        None => insert_event(conn, coven_home, session_id, kind, payload),
+    }
 }
 
 fn update_familiar_icon(
@@ -9091,6 +9123,70 @@ mod tests {
             self.kills.borrow_mut().push(session_id.to_string());
             Ok(())
         }
+    }
+
+    /// Runtime whose direct-event persistence is backed by a real
+    /// `EventWriter`, so accepted `input`/`kill`/`cast` events flush the
+    /// writer's pending truncation marker ahead of the boundary event (#642).
+    struct WriterBackedRuntime {
+        writer: crate::event_writer::EventWriter,
+    }
+
+    impl SessionRuntime for WriterBackedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn record_session_event(
+            &self,
+            session_id: &str,
+            kind: &str,
+            payload: &Value,
+        ) -> Option<Result<()>> {
+            Some(self.writer.record(session_id, kind, payload.clone()))
+        }
+    }
+
+    #[test]
+    fn accepted_input_flushes_pending_truncation_marker_before_the_event() -> Result<()> {
+        // #642: an accepted `input` event must be preceded by the writer's
+        // pending output-truncation marker. Routing the event through the
+        // shared EventWriter (instead of a direct store::insert_event) is what
+        // closes the gap; a direct insert would persist `input` while the marker
+        // stayed queued, leaving the boundary event ahead of the truncation.
+        let coven_home = tempfile::tempdir()?;
+        insert_test_session(coven_home.path(), "sess-trunc")?;
+        let writer = crate::event_writer::EventWriter::start_with_capacity(
+            coven_home.path().to_path_buf(),
+            crate::event_writer::RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+        // Force a dropped output chunk -> pending truncation episode.
+        assert!(!writer.record_output("sess-trunc", "x".repeat(2048))?);
+        let runtime = WriterBackedRuntime { writer };
+
+        let response = record_input(
+            coven_home.path(),
+            "sess-trunc",
+            Some(r#"{"data":"ls\n"}"#),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 202);
+
+        let conn = crate::store::open_store(&coven_home.path().join("coven.sqlite3"))?;
+        let kinds: Vec<String> = crate::store::list_events(&conn, "sess-trunc")?
+            .into_iter()
+            .map(|event| event.kind)
+            .collect();
+        assert_eq!(kinds, vec!["output_truncated", "input"]);
+        Ok(())
     }
 
     struct FailingLaunchRuntime;

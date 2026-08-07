@@ -402,6 +402,23 @@ impl SessionRuntime for LiveSessionRuntime {
         LiveSessionRuntime::kill_session(self, session_id)
     }
 
+    /// Route accepted `input`/`kill`/`cast` events through the shared
+    /// `EventWriter` so its pending output-truncation marker is flushed ahead of
+    /// the event (issue #642). These events previously persisted via a direct
+    /// `store::insert_event`, which bypassed the writer's truncation state and
+    /// let a truncation marker land *after* a boundary event that should have
+    /// closed the gap. Falls back to `None` (direct insert) when the runtime has
+    /// no writer.
+    fn record_session_event(
+        &self,
+        session_id: &str,
+        kind: &str,
+        payload: &Value,
+    ) -> Option<Result<()>> {
+        let writer = self.event_writer.as_ref()?;
+        Some(writer.record(session_id, kind, payload.clone()))
+    }
+
     /// Must stay in this trait impl: `api::handle_request_with_runtime` reaches
     /// the runtime through `&dyn SessionRuntime`, so an inherent method of the
     /// same name is unreachable and `GET /health` silently falls back to the

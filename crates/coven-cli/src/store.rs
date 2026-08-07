@@ -3240,6 +3240,24 @@ pub fn list_events(conn: &Connection, session_id: &str) -> Result<Vec<EventRecor
     list_events_with_options(conn, session_id, &EventsQueryOptions::default())
 }
 
+/// Return the highest event `seq` (SQLite rowid) for a session, or 0 when the
+/// session has no events. This is the cursor the handoff protocol snapshots.
+///
+/// Reading the cursor previously materialized every event row for the session
+/// (including raw PTY output payloads) just to inspect the last `seq`. A scalar
+/// `MAX(rowid)` reads a single value and matches that old full-scan result
+/// exactly, including the empty-transcript case (0).
+pub fn max_event_seq(conn: &Connection, session_id: &str) -> Result<i64> {
+    let max: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .context("failed to query max event seq")?;
+    Ok(max)
+}
+
 pub fn event_kind_exists(conn: &Connection, session_id: &str, kind: &str) -> Result<bool> {
     use rusqlite::OptionalExtension;
 
@@ -6295,6 +6313,43 @@ mod tests {
 
         assert_eq!(tail.len(), 2);
         assert!(tail[0].seq > after_seq);
+        Ok(())
+    }
+
+    #[test]
+    fn max_event_seq_matches_full_scan_last_seq() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        insert_session(&conn, &session_record("session-1", "2026-04-27T06:00:00Z"))?;
+
+        // Empty transcript: both the old full-scan read and max_event_seq must
+        // agree on 0.
+        let old_empty = list_events(&conn, "session-1")?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or(0);
+        assert_eq!(old_empty, 0);
+        assert_eq!(max_event_seq(&conn, "session-1")?, 0);
+
+        for i in 1..=5 {
+            insert_json_event(
+                &conn,
+                "session-1",
+                "output",
+                &serde_json::json!({ "data": format!("line {i}") }),
+                "2026-04-27T06:01:00Z",
+            )?;
+        }
+
+        let old_last = list_events(&conn, "session-1")?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or(0);
+        assert_eq!(max_event_seq(&conn, "session-1")?, old_last);
+
+        // A distinct session must not leak into another session's max.
+        insert_session(&conn, &session_record("session-2", "2026-04-27T06:00:00Z"))?;
+        assert_eq!(max_event_seq(&conn, "session-2")?, 0);
         Ok(())
     }
 

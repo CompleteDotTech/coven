@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{pty_runner::PtyRunResult, store, STORE_FILE_NAME};
 
 const DEFAULT_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
-const RESERVED_CRITICAL_BYTES: usize = 128 * 1024;
+pub(crate) const RESERVED_CRITICAL_BYTES: usize = 128 * 1024;
 const EVENT_OVERHEAD_BYTES: usize = 512;
 const MAX_BATCH_EVENTS: usize = 64;
 const COALESCE_WINDOW: Duration = Duration::from_millis(12);
@@ -111,7 +111,7 @@ impl EventWriter {
         Self::start_with_capacity(coven_home, DEFAULT_CAPACITY_BYTES)
     }
 
-    fn start_with_capacity(coven_home: PathBuf, capacity_bytes: usize) -> Result<Self> {
+    pub(crate) fn start_with_capacity(coven_home: PathBuf, capacity_bytes: usize) -> Result<Self> {
         anyhow::ensure!(
             capacity_bytes > RESERVED_CRITICAL_BYTES,
             "event writer capacity must reserve room for critical events"
@@ -174,7 +174,8 @@ impl EventWriter {
 
     /// Persist a non-output event.  These events reserve capacity and wait for
     /// the writer's commit acknowledgement instead of being silently dropped.
-    #[allow(dead_code)]
+    /// Accepted `input`/`kill`/`cast` events route here so a pending
+    /// output-truncation marker is flushed ahead of the boundary event.
     pub fn record(&self, session_id: &str, kind: &str, payload: serde_json::Value) -> Result<()> {
         let record = store::EventRecord {
             seq: 0,
@@ -1390,6 +1391,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["output", "exit"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_session_events_flush_their_own_truncation_marker() -> Result<()> {
+        // Issue #642: accepted input/kill/cast events must route through the
+        // writer's `record` path so a pending truncation marker is flushed
+        // ahead of each boundary event, and separate pressure episodes must
+        // yield separate markers rather than combining across a boundary.
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+        let writer = EventWriter::start_with_capacity(
+            home.path().to_path_buf(),
+            RESERVED_CRITICAL_BYTES + 1024,
+        )?;
+
+        // Episode 1: one dropped chunk, then an accepted `input` boundary event.
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        writer.record("s-1", "input", json!({ "data": "ls\n" }))?;
+
+        // Episode 2: two dropped chunks, then an accepted `kill` boundary event.
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(!writer.record_output("s-1", "x".repeat(3072))?);
+        writer.record("s-1", "kill", json!({ "status": "killed" }))?;
+
+        // Episode 3: one dropped chunk, then recovered output.
+        assert!(!writer.record_output("s-1", "x".repeat(2048))?);
+        assert!(writer.record_output("s-1", "recovered".to_string())?);
+        writer.record_exit(
+            "s-1",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let events = store::list_events(&conn, "s-1")?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "output_truncated",
+                "input",
+                "output_truncated",
+                "kill",
+                "output_truncated",
+                "output",
+                "exit",
+            ]
+        );
+
+        // Each marker carries only the drops from its own episode — nothing
+        // combines across the input/kill boundary events.
+        let marker_before_input: serde_json::Value = serde_json::from_str(&events[0].payload_json)?;
+        assert_eq!(marker_before_input["droppedEvents"], 1);
+        assert_eq!(marker_before_input["droppedBytes"], 2048);
+
+        let marker_before_kill: serde_json::Value = serde_json::from_str(&events[2].payload_json)?;
+        assert_eq!(marker_before_kill["droppedEvents"], 2);
+        assert_eq!(marker_before_kill["droppedBytes"], 5120);
+
+        let marker_before_output: serde_json::Value =
+            serde_json::from_str(&events[4].payload_json)?;
+        assert_eq!(marker_before_output["droppedEvents"], 1);
+        assert_eq!(marker_before_output["droppedBytes"], 2048);
         Ok(())
     }
 
