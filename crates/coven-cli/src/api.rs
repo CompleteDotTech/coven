@@ -2132,11 +2132,16 @@ fn claim_session_handoff(coven_home: &Path, path: &str, body: Option<&str>) -> R
         .context("stored handoff workspace snapshot is invalid")?;
     let current_workspace = WorkspaceSnapshot::capture(Path::new(&session.project_root));
     let current_cursor = store::max_event_seq(&conn, session_id)?;
-    if current_cursor != handoff.event_cursor {
+    // Prefix / forward-allowed contract: the handoff snapshot describes a prefix
+    // of the live transcript. Forward movement (the running session emitting more
+    // output after the snapshot) is expected and NOT divergence. Only a backward
+    // cursor -- the transcript being truncated or rewritten below the snapshot
+    // point -- means the recorded prefix no longer exists, so we fail closed.
+    if current_cursor < handoff.event_cursor {
         return api_error(
             409,
             "transcript_diverged",
-            "Source transcript changed after the handoff snapshot.",
+            "Source transcript was truncated below the handoff snapshot.",
             Some(
                 json!({ "handoffId": handoff_id, "expectedCursor": handoff.event_cursor, "actualCursor": current_cursor }),
             ),
@@ -2165,7 +2170,13 @@ fn claim_session_handoff(coven_home: &Path, path: &str, body: Option<&str>) -> R
     };
     json_response(
         200,
-        &json!({ "handoff": claimed, "sourceInputFenced": true }),
+        &json!({
+            "handoff": claimed,
+            "sourceInputFenced": true,
+            // The claimant must resume from the snapshot point, not the current
+            // (possibly-advanced) tail, so it replays exactly the recorded prefix.
+            "resumeFrom": handoff.event_cursor,
+        }),
     )
 }
 
@@ -2193,21 +2204,25 @@ fn acknowledge_session_handoff(
         return api_error(404, "handoff_not_found", "Handoff was not found.", None);
     }
     let current_cursor = store::max_event_seq(&conn, session_id)?;
-    if current_cursor != handoff.event_cursor {
+    // Prefix / forward-allowed contract: only a backward cursor (truncated or
+    // rewritten transcript) is divergence. Forward movement is allowed.
+    if current_cursor < handoff.event_cursor {
         return api_error(
             409,
             "transcript_diverged",
-            "Source transcript changed after the handoff snapshot.",
+            "Source transcript was truncated below the handoff snapshot.",
             Some(
                 json!({ "handoffId": handoff_id, "expectedCursor": handoff.event_cursor, "actualCursor": current_cursor }),
             ),
         );
     }
+    // Acknowledge against the snapshot cursor -- the prefix the handoff recorded --
+    // not the (possibly-advanced) live tail, so store-level consistency holds.
     let acknowledged = match store::acknowledge_handoff(
         &mut conn,
         handoff_id,
         &request.claimant,
-        current_cursor,
+        handoff.event_cursor,
         &current_timestamp(),
     ) {
         Ok(record) => record,
@@ -9427,6 +9442,16 @@ mod tests {
     #[test]
     fn handoff_claim_fails_closed_when_transcript_or_workspace_diverges() -> anyhow::Result<()> {
         let (temp, workspace) = portable_handoff_fixture()?;
+        // Produce transcript output BEFORE the handoff so the snapshot cursor is
+        // non-zero, then offer the handoff at that cursor.
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp.path(),
+            None,
+            Some(r#"{"data":"pre-handoff output"}"#),
+        )?;
+        assert_eq!(input.status, 202);
         let offered = handle_request_with_body(
             "POST",
             "/sessions/session-1/handoffs",
@@ -9437,14 +9462,21 @@ mod tests {
         let offered: Value = serde_json::from_str(&offered.body)?;
         let handoff_id = offered["handoff"]["id"].as_str().unwrap();
         let generation = offered["handoff"]["generation"].as_i64().unwrap();
-        let input = handle_request_with_body(
-            "POST",
-            "/sessions/session-1/input",
-            temp.path(),
-            None,
-            Some(r#"{"data":"new source input"}"#),
-        )?;
-        assert_eq!(input.status, 202);
+        let snapshot_cursor = offered["eventCursor"].as_i64().unwrap();
+        assert!(snapshot_cursor > 0);
+
+        // Simulate a truncated/rewritten transcript: the current cursor moves
+        // BACKWARD below the snapshot point. This is the only case the prefix
+        // contract treats as divergence.
+        {
+            let conn = crate::store::open_store(&temp.path().join("coven.sqlite3"))?;
+            conn.execute(
+                "DELETE FROM events WHERE session_id = ?1 AND rowid = (
+                     SELECT MAX(rowid) FROM events WHERE session_id = ?1
+                 )",
+                rusqlite::params!["session-1"],
+            )?;
+        }
         let transcript_conflict = handle_request_with_body(
             "POST", &format!("/sessions/session-1/handoffs/{handoff_id}/claim"), temp.path(), None,
             Some(&json!({ "expectedGeneration": generation, "claimant": "device:phone-1", "idempotencyKey": "claim-1", "destinationWorkspace": workspace }).to_string()),
@@ -9483,6 +9515,69 @@ mod tests {
         assert_eq!(workspace_conflict.status, 409);
         let body: Value = serde_json::from_str(&workspace_conflict.body)?;
         assert_eq!(body["error"]["code"], "workspace_diverged");
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_claim_allows_forward_cursor_and_exposes_resume_from() -> anyhow::Result<()> {
+        let (temp, workspace) = portable_handoff_fixture()?;
+        // Offer a handoff on a live, running session. The snapshot cursor is
+        // captured at emit time.
+        let offered = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/handoffs",
+            temp.path(),
+            None,
+            Some(&handoff_packet().to_string()),
+        )?;
+        assert_eq!(offered.status, 201);
+        let offered: Value = serde_json::from_str(&offered.body)?;
+        let handoff_id = offered["handoff"]["id"].as_str().unwrap();
+        let generation = offered["handoff"]["generation"].as_i64().unwrap();
+        let snapshot_cursor = offered["eventCursor"].as_i64().unwrap();
+
+        // The running session keeps producing output BETWEEN emit and claim,
+        // moving the transcript cursor strictly forward.
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/session-1/input",
+            temp.path(),
+            None,
+            Some(r#"{"data":"busy session output"}"#),
+        )?;
+        assert_eq!(input.status, 202);
+
+        // Under the prefix / forward-allowed contract, a forward cursor is not
+        // divergence: the claim succeeds and tells the claimant where to resume.
+        let claimed = handle_request_with_body(
+            "POST",
+            &format!("/sessions/session-1/handoffs/{handoff_id}/claim"),
+            temp.path(),
+            None,
+            Some(
+                &json!({
+                    "expectedGeneration": generation,
+                    "claimant": "device:phone-1",
+                    "idempotencyKey": "claim-forward",
+                    "destinationWorkspace": workspace,
+                })
+                .to_string(),
+            ),
+        )?;
+        assert_eq!(claimed.status, 200);
+        let claimed: Value = serde_json::from_str(&claimed.body)?;
+        assert_eq!(claimed["resumeFrom"].as_i64(), Some(snapshot_cursor));
+        assert_eq!(claimed["handoff"]["state"], "claimed");
+
+        // Acknowledgement also tolerates the forward cursor.
+        let acknowledgement = handle_request_with_body(
+            "POST",
+            &format!("/sessions/session-1/handoffs/{handoff_id}/ack"),
+            temp.path(),
+            None,
+            Some(r#"{"claimant":"device:phone-1"}"#),
+        )?;
+        assert_eq!(acknowledgement.status, 200);
         Ok(())
     }
 
